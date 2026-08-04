@@ -2,36 +2,11 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
-async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-
-  return worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html" },
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
-  );
-}
-
-test("server-renders the BrickCheck loading shell and metadata", async () => {
-  const response = await render();
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
-
-  const html = await response.text();
+test("static export contains the BrickCheck loading shell and metadata", async () => {
+  const html = await readFile(new URL("../dist/client/index.html", import.meta.url), "utf8");
   assert.match(html, /<title>BrickCheck — Find every piece<\/title>/i);
   assert.match(html, /name="description" content="Search a LEGO set/);
-  assert.match(html, /property="og:image" content="http:\/\/localhost(?::3000)?\/og\.png"/);
+  assert.match(html, /property="og:image" content="[^"]+\/og\.png"/);
   assert.match(html, /href="\/brickcheck-icon\.webp"/);
   assert.match(html, /class="loading-screen"/);
   assert.match(html, /Opening your workbench…/);
@@ -89,9 +64,12 @@ test("is configured for a repository-path-safe GitHub Pages export", async () =>
 
   assert.match(nextConfig, /output:\s*"export"/);
   assert.match(nextConfig, /GITHUB_REPOSITORY/);
+  assert.match(nextConfig, /PAGES_BASE_PATH/);
+  assert.match(nextConfig, /PAGES_SITE_URL/);
   assert.match(nextConfig, /assetPrefix:\s*basePath/);
   assert.match(viteConfig, /base:\s*githubPagesBase/);
   assert.match(workflow, /actions\/configure-pages@v5/);
+  assert.match(workflow, /PAGES_BASE_PATH:\s*\$\{\{ steps\.pages\.outputs\.base_path \|\| '\/' \}\}/);
   assert.match(workflow, /actions\/upload-pages-artifact@v4/);
   assert.match(workflow, /path:\s*dist\/client/);
   assert.match(workflow, /actions\/deploy-pages@v4/);

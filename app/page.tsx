@@ -83,6 +83,13 @@ type GalleryState = {
   externalUrl?: string;
 };
 
+type BrickLinkXmlState = {
+  setNum: string;
+  xml: string;
+  lotCount: number;
+  pieceCount: number;
+};
+
 type MissingPart = {
   part: PartItem;
   quantity: number;
@@ -441,8 +448,10 @@ export default function BrickCheckApp() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [exportingBrickLink, setExportingBrickLink] = useState(false);
+  const [bricklinkXml, setBricklinkXml] = useState<BrickLinkXmlState | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
+  const bricklinkXmlRef = useRef<HTMLTextAreaElement>(null);
   const searchRequestRef = useRef(0);
   const themeMapRef = useRef<Map<number, string>>(new Map());
 
@@ -898,6 +907,7 @@ export default function BrickCheckApp() {
   const exportMissingBrickLink = async () => {
     if (!activeSet || exportingBrickLink) return;
     setExportingBrickLink(true);
+    setBricklinkXml(null);
     setError("");
 
     try {
@@ -1028,14 +1038,34 @@ export default function BrickCheckApp() {
           "  </ITEM>",
         ].join("\n"));
       const xml = ["<INVENTORY>", ...items, "</INVENTORY>", ""].join("\n");
-      const safeSetNum = activeSet.setNum.replace(/[^a-z0-9_-]+/gi, "-");
-      downloadText(`bricklink-missing-${safeSetNum}.xml`, xml, "application/xml;charset=utf-8");
       const pieceCount = Array.from(groupedLots.values()).reduce((total, lot) => total + lot.quantity, 0);
-      setNotice(`${groupedLots.size} BrickLink lot${groupedLots.size === 1 ? "" : "s"} exported · ${pieceCount} pieces`);
+      setBricklinkXml({
+        setNum: activeSet.setNum,
+        xml,
+        lotCount: groupedLots.size,
+        pieceCount,
+      });
     } catch (exportError) {
-      setNotice(exportError instanceof Error ? exportError.message : "Could not create the BrickLink XML file.");
+      setNotice(exportError instanceof Error ? exportError.message : "Could not generate the BrickLink XML.");
     } finally {
       setExportingBrickLink(false);
+    }
+  };
+
+  const copyBricklinkXml = async () => {
+    if (!bricklinkXml) return;
+    try {
+      await navigator.clipboard.writeText(bricklinkXml.xml);
+      setNotice("BrickLink XML copied to clipboard");
+    } catch {
+      const textArea = bricklinkXmlRef.current;
+      textArea?.focus();
+      textArea?.select();
+      if (textArea && document.execCommand("copy")) {
+        setNotice("BrickLink XML copied to clipboard");
+      } else {
+        setNotice("Select the XML and copy it manually.");
+      }
     }
   };
 
@@ -1228,12 +1258,12 @@ export default function BrickCheckApp() {
                 <button className="secondary compact" onClick={() => exportSet(activeSet)}>↓ Save file</button>
                 <button
                   className="secondary compact bricklink-export"
-                  aria-label="Export missing parts as BrickLink Wanted List XML"
-                  title="Export missing parts as BrickLink Wanted List XML"
+                  aria-label="Generate copyable BrickLink Wanted List XML"
+                  title="Generate copyable BrickLink Wanted List XML"
                   disabled={exportingBrickLink || missingLots === 0}
                   onClick={() => void exportMissingBrickLink()}
                 >
-                  {exportingBrickLink ? "Preparing…" : "↓ BrickLink XML"}
+                  {exportingBrickLink ? "Preparing…" : "Copy BrickLink XML"}
                 </button>
               </div>
             </div>
@@ -1544,6 +1574,35 @@ export default function BrickCheckApp() {
                 {gallery.images.map((image, index) => <button className={gallery.index === index ? "active" : ""} key={image} aria-label={`Show image ${index + 1}`} onClick={() => setGallery((current) => current ? { ...current, index } : null)}><img src={image} alt="" /></button>)}
               </div>
             )}
+          </section>
+        </div>
+      )}
+
+      {bricklinkXml && (
+        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setBricklinkXml(null); }}>
+          <section className="bricklink-modal" role="dialog" aria-modal="true" aria-labelledby="bricklink-xml-title">
+            <button className="modal-close" aria-label="Close BrickLink XML" onClick={() => setBricklinkXml(null)}>×</button>
+            <p className="eyebrow">BRICKLINK WANTED LIST</p>
+            <h2 id="bricklink-xml-title">Copy missing parts XML</h2>
+            <p className="bricklink-copy-summary">
+              {bricklinkXml.setNum} · {bricklinkXml.lotCount} lot{bricklinkXml.lotCount === 1 ? "" : "s"} · {bricklinkXml.pieceCount} piece{bricklinkXml.pieceCount === 1 ? "" : "s"}
+            </p>
+            <textarea
+              ref={bricklinkXmlRef}
+              className="bricklink-xml-output"
+              aria-label="Generated BrickLink XML"
+              value={bricklinkXml.xml}
+              readOnly
+              spellCheck={false}
+              onFocus={(event) => event.currentTarget.select()}
+            />
+            <div className="bricklink-copy-actions">
+              <p>Copy this text, then choose <strong>Upload BrickLink XML format</strong> on BrickLink.</p>
+              <div>
+                <a href="https://www.bricklink.com/v2/wanted/upload.page" target="_blank" rel="noreferrer">Open BrickLink ↗</a>
+                <button className="primary" onClick={() => void copyBricklinkXml()}>Copy XML</button>
+              </div>
+            </div>
           </section>
         </div>
       )}

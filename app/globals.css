@@ -326,7 +326,13 @@ button:focus-visible, input:focus-visible, a:focus-visible, [role="button"]:focu
 .progress-numbers strong { display: block; font-size: 21px; }
 .progress-numbers strong span { color: #777; font-weight: 400; }
 .progress-numbers small { color: var(--muted); font-size: 10px; }
-.progress-summary .secondary { grid-column: 1 / -1; }
+.progress-actions {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 7px;
+}
+.progress-actions .secondary { width: 100%; }
+.progress-actions .bricklink-export { border-color: var(--yellow); color: var(--yellow); }
 
 .inventory-toolbar {
   position: sticky;
@@ -1205,7 +1211,8 @@ footer a { color: white; font-weight: 700; text-decoration: none; }
   .progress-summary { grid-column: 1 / -1; display: flex; padding: 12px 18px; border-top: 1px solid var(--line); border-left: 0; }
   .progress-ring { width: 62px; height: 62px; }
   .progress-ring::before { width: 50px; height: 50px; }
-  .progress-summary .secondary { margin-left: auto; }
+  .progress-actions { display: flex; margin-left: auto; }
+  .progress-actions .secondary { width: auto; }
   .sets-grid.list .set-card-copy { grid-template-columns: minmax(0,1fr) 135px; }
 }
 
@@ -1282,4 +1289,5 @@ footer a { color: white; font-weight: 700; text-decoration: none; }
   .search-results { grid-template-columns: 1fr; }
   .search-results article { min-height: 300px; }
   .gallery-footer { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .progress-actions { flex-direction: column; }
 }

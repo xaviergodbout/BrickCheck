@@ -38,6 +38,12 @@ test("keeps the inventory interactions and full-height shell in source", async (
   assert.match(page, /setImages: string\[\]/);
   assert.match(page, /translateY\(-3px\)/);
   assert.match(page, /prefers-reduced-motion: reduce/);
+  assert.match(page, /exportMissingBrickLink/);
+  assert.match(page, /bricklink-missing-\$\{safeSetNum\}\.xml/);
+  assert.match(page, /<ITEMTYPE>P<\/ITEMTYPE>/);
+  assert.match(page, /<MINQTY>\$\{lot\.quantity\}<\/MINQTY>/);
+  assert.match(page, /application\/xml;charset=utf-8/);
+  assert.match(page, /!part\.spare && part\.found < part\.quantity/);
   assert.doesNotMatch(page, />Mark all</i);
   assert.doesNotMatch(page, /Explore sample check/i);
   assert.match(css, /\.app-shell\s*\{[^}]*min-height:\s*100vh/s);

@@ -25,6 +25,9 @@ type SearchSort = "relevance" | "date_desc" | "date_asc" | "pieces_desc" | "piec
 type PartItem = {
   id: string;
   partNum: string;
+  bricklinkPartNum?: string;
+  colorId?: number;
+  bricklinkColorId?: number;
   name: string;
   colorName: string;
   colorRgb: string;
@@ -80,6 +83,17 @@ type GalleryState = {
   externalUrl?: string;
 };
 
+type MissingPart = {
+  part: PartItem;
+  quantity: number;
+};
+
+type BrickLinkColorMaps = {
+  byRebrickableId: Map<number, number>;
+  byName: Map<string, number>;
+  byRgb: Map<string, number>;
+};
+
 const STORAGE_KEY = "brickcheck:sets:v1";
 const API_KEY_STORAGE = "brickcheck:rebrickable-key";
 const VIEW_STORAGE = "brickcheck:view";
@@ -92,6 +106,45 @@ const APP_BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function externalId(source: unknown, provider: string) {
+  if (!source || typeof source !== "object") return undefined;
+  const entry = Object.entries(source).find(([name]) => name.toLowerCase() === provider.toLowerCase())?.[1];
+  const entryRecord = entry && typeof entry === "object" && !Array.isArray(entry)
+    ? entry as Record<string, unknown>
+    : undefined;
+  const values = Array.isArray(entry)
+    ? entry
+    : Array.isArray(entryRecord?.ext_ids)
+      ? entryRecord.ext_ids
+      : entry == null
+        ? []
+        : [entry];
+  const value = values.find((candidate) => candidate != null && String(candidate).trim());
+  return value == null ? undefined : String(value);
+}
+
+function normaliseColorKey(value: string) {
+  return value.trim().replace(/^#/, "").toLowerCase();
+}
+
+function inferRebrickableColorId(part: PartItem) {
+  if (Number.isFinite(part.colorId)) return Number(part.colorId);
+  const marker = `:${part.partNum}:`;
+  const markerIndex = part.id.indexOf(marker);
+  if (markerIndex < 0) return undefined;
+  const inferred = Number(part.id.slice(markerIndex + marker.length).split(":")[0]);
+  return Number.isFinite(inferred) ? inferred : undefined;
+}
+
+function escapeXml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function isBrickBuiltSet(result: SearchResult) {
@@ -305,9 +358,15 @@ async function rebrickableList(path: string, key: string, maxResults = Number.PO
 function mapApiPart(raw: any, prefix = "part"): PartItem {
   const colorId = raw.color?.id ?? "0";
   const partNum = raw.part?.part_num ?? raw.part_num ?? "unknown";
+  const bricklinkPartNum = externalId(raw.part?.external_ids ?? raw.external_ids, "BrickLink");
+  const bricklinkColorValue = externalId(raw.color?.external_ids, "BrickLink");
+  const bricklinkColorId = bricklinkColorValue == null ? undefined : Number(bricklinkColorValue);
   return {
     id: `${prefix}:${partNum}:${colorId}:${raw.id ?? ""}`,
     partNum,
+    bricklinkPartNum,
+    colorId: Number.isFinite(Number(colorId)) ? Number(colorId) : undefined,
+    bricklinkColorId: Number.isFinite(bricklinkColorId) ? bricklinkColorId : undefined,
     name: raw.part?.name ?? raw.name ?? "Unknown part",
     colorName: raw.color?.name ?? "Unknown color",
     colorRgb: raw.color?.rgb ?? "E7E5DF",
@@ -381,6 +440,7 @@ export default function BrickCheckApp() {
   const [apiDraft, setApiDraft] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [exportingBrickLink, setExportingBrickLink] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
   const searchRequestRef = useRef(0);
@@ -718,12 +778,12 @@ export default function BrickCheckApp() {
     try {
       const [rawParts, rawMinifigs] = result.kind === "minifig"
         ? await Promise.all([
-            rebrickableList(`/lego/minifigs/${encodeURIComponent(result.set_num)}/parts/?page_size=1000`, apiKey),
+            rebrickableList(`/lego/minifigs/${encodeURIComponent(result.set_num)}/parts/?page_size=1000&inc_part_details=1`, apiKey),
             Promise.resolve([]),
           ])
         : await Promise.all([
             rebrickableList(
-              `/lego/sets/${encodeURIComponent(result.set_num)}/parts/?page_size=1000&inc_minifig_parts=0`,
+              `/lego/sets/${encodeURIComponent(result.set_num)}/parts/?page_size=1000&inc_minifig_parts=0&inc_part_details=1`,
               apiKey,
             ),
             rebrickableList(
@@ -784,7 +844,7 @@ export default function BrickCheckApp() {
         activeSet.minifigs.map(async (fig) => {
           if (fig.parts?.length) return fig;
           const rawParts = await rebrickableList(
-            `/lego/minifigs/${encodeURIComponent(fig.figNum)}/parts/?page_size=1000`,
+            `/lego/minifigs/${encodeURIComponent(fig.figNum)}/parts/?page_size=1000&inc_part_details=1`,
             apiKey,
           );
           return {
@@ -801,10 +861,8 @@ export default function BrickCheckApp() {
     }
   };
 
-  const download = (filename: string, payload: unknown) => {
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: "application/json",
-    });
+  const downloadText = (filename: string, content: string, type: string) => {
+    const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -813,8 +871,12 @@ export default function BrickCheckApp() {
     URL.revokeObjectURL(url);
   };
 
+  const downloadJson = (filename: string, payload: unknown) => {
+    downloadText(filename, JSON.stringify(payload, null, 2), "application/json");
+  };
+
   const exportSet = (set: SavedSet) => {
-    download(`brickcheck-${set.setNum}.json`, {
+    downloadJson(`brickcheck-${set.setNum}.json`, {
       format: "brickcheck",
       version: 1,
       exportedAt: new Date().toISOString(),
@@ -824,13 +886,157 @@ export default function BrickCheckApp() {
   };
 
   const exportAll = () => {
-    download("brickcheck-all-sets.json", {
+    downloadJson("brickcheck-all-sets.json", {
       format: "brickcheck",
       version: 1,
       exportedAt: new Date().toISOString(),
       sets,
     });
     setNotice(`${sets.length} set${sets.length === 1 ? "" : "s"} exported`);
+  };
+
+  const exportMissingBrickLink = async () => {
+    if (!activeSet || exportingBrickLink) return;
+    setExportingBrickLink(true);
+    setError("");
+
+    try {
+      const missingParts: MissingPart[] = activeSet.parts
+        .filter((part) => !part.spare && part.found < part.quantity)
+        .map((part) => ({ part, quantity: part.quantity - part.found }));
+
+      if (activeSet.minifigMode === "parts") {
+        activeSet.minifigs.forEach((fig) => {
+          (fig.parts ?? [])
+            .filter((part) => !part.spare && part.found < part.quantity)
+            .forEach((part) => missingParts.push({ part, quantity: part.quantity - part.found }));
+        });
+      } else {
+        for (const fig of activeSet.minifigs) {
+          const missingFigures = fig.quantity - fig.found;
+          if (missingFigures <= 0) continue;
+          let figureParts = fig.parts;
+          if (!figureParts?.length) {
+            if (!apiKey) {
+              setApiDraft(apiKey);
+              setSettingsOpen(true);
+              throw new Error("Connect Rebrickable to expand missing minifigures into orderable parts.");
+            }
+            const rawParts = await rebrickableList(
+              `/lego/minifigs/${encodeURIComponent(fig.figNum)}/parts/?page_size=1000&inc_part_details=1`,
+              apiKey,
+            );
+            figureParts = rawParts.map((part) => mapApiPart(part, fig.figNum));
+          }
+          figureParts
+            .filter((part) => !part.spare)
+            .forEach((part) => missingParts.push({ part, quantity: part.quantity * missingFigures }));
+        }
+      }
+
+      if (!missingParts.length) {
+        setNotice("No missing parts to export — this check is complete.");
+        return;
+      }
+
+      const needsColorMap = missingParts.some(({ part }) => !Number.isFinite(part.bricklinkColorId));
+      const colorMaps: BrickLinkColorMaps = {
+        byRebrickableId: new Map(),
+        byName: new Map(),
+        byRgb: new Map(),
+      };
+
+      if (needsColorMap) {
+        if (!apiKey) {
+          setApiDraft(apiKey);
+          setSettingsOpen(true);
+          throw new Error("Connect Rebrickable to map saved colors to BrickLink color IDs.");
+        }
+        const rawColors = await rebrickableList("/lego/colors/?page_size=1000", apiKey);
+        rawColors.forEach((value) => {
+          const raw = value as { external_ids?: unknown; id?: unknown; name?: unknown; rgb?: unknown };
+          const bricklinkValue = externalId(raw.external_ids, "BrickLink");
+          const bricklinkId = bricklinkValue == null ? Number.NaN : Number(bricklinkValue);
+          if (!Number.isFinite(bricklinkId)) return;
+          const rebrickableId = Number(raw.id);
+          if (Number.isFinite(rebrickableId)) colorMaps.byRebrickableId.set(rebrickableId, bricklinkId);
+          if (raw.name) colorMaps.byName.set(String(raw.name).trim().toLowerCase(), bricklinkId);
+          if (raw.rgb) colorMaps.byRgb.set(normaliseColorKey(String(raw.rgb)), bricklinkId);
+        });
+      }
+
+      const unresolvedPartNums = Array.from(new Set(
+        missingParts
+          .filter(({ part }) => !part.bricklinkPartNum)
+          .map(({ part }) => part.partNum)
+          .filter((partNum) => partNum && partNum !== "unknown"),
+      ));
+      const bricklinkPartNumbers = new Map<string, string>();
+      if (apiKey && unresolvedPartNums.length) {
+        for (let index = 0; index < unresolvedPartNums.length; index += 150) {
+          const partNums = unresolvedPartNums.slice(index, index + 150);
+          const rawParts = await rebrickableList(
+            `/lego/parts/?part_nums=${encodeURIComponent(partNums.join(","))}&inc_part_details=1&page_size=1000`,
+            apiKey,
+          );
+          rawParts.forEach((value) => {
+            const raw = value as { part_num?: unknown; external_ids?: unknown };
+            const partNum = String(raw.part_num ?? "");
+            const bricklinkPartNum = externalId(raw.external_ids, "BrickLink");
+            if (partNum && bricklinkPartNum) bricklinkPartNumbers.set(partNum, bricklinkPartNum);
+          });
+        }
+      }
+
+      const groupedLots = new Map<string, { itemId: string; colorId: number; quantity: number }>();
+      const unmappedColors = new Set<string>();
+      missingParts.forEach(({ part, quantity }) => {
+        const rebrickableColorId = inferRebrickableColorId(part);
+        const colorId = Number.isFinite(part.bricklinkColorId)
+          ? Number(part.bricklinkColorId)
+          : (rebrickableColorId == null ? undefined : colorMaps.byRebrickableId.get(rebrickableColorId))
+            ?? colorMaps.byName.get(part.colorName.trim().toLowerCase())
+            ?? colorMaps.byRgb.get(normaliseColorKey(part.colorRgb));
+        if (!Number.isFinite(colorId)) {
+          unmappedColors.add(part.colorName);
+          return;
+        }
+        const itemId = part.bricklinkPartNum ?? bricklinkPartNumbers.get(part.partNum) ?? part.partNum;
+        const key = `${itemId}:${colorId}`;
+        const existing = groupedLots.get(key);
+        groupedLots.set(key, {
+          itemId,
+          colorId: Number(colorId),
+          quantity: (existing?.quantity ?? 0) + quantity,
+        });
+      });
+
+      if (unmappedColors.size) {
+        throw new Error(`Could not map ${Array.from(unmappedColors).slice(0, 3).join(", ")} to BrickLink colors.`);
+      }
+
+      const remarks = escapeXml(`BrickCheck ${activeSet.setNum}`);
+      const items = Array.from(groupedLots.values())
+        .sort((a, b) => a.itemId.localeCompare(b.itemId, undefined, { numeric: true }) || a.colorId - b.colorId)
+        .map((lot) => [
+          "  <ITEM>",
+          "    <ITEMTYPE>P</ITEMTYPE>",
+          `    <ITEMID>${escapeXml(lot.itemId)}</ITEMID>`,
+          `    <COLOR>${lot.colorId}</COLOR>`,
+          `    <MINQTY>${lot.quantity}</MINQTY>`,
+          `    <REMARKS>${remarks}</REMARKS>`,
+          "  </ITEM>",
+        ].join("\n"));
+      const xml = ["<INVENTORY>", ...items, "</INVENTORY>", ""].join("\n");
+      const safeSetNum = activeSet.setNum.replace(/[^a-z0-9_-]+/gi, "-");
+      downloadText(`bricklink-missing-${safeSetNum}.xml`, xml, "application/xml;charset=utf-8");
+      const pieceCount = Array.from(groupedLots.values()).reduce((total, lot) => total + lot.quantity, 0);
+      setNotice(`${groupedLots.size} BrickLink lot${groupedLots.size === 1 ? "" : "s"} exported · ${pieceCount} pieces`);
+    } catch (exportError) {
+      setNotice(exportError instanceof Error ? exportError.message : "Could not create the BrickLink XML file.");
+    } finally {
+      setExportingBrickLink(false);
+    }
   };
 
   const importSets = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1018,7 +1224,18 @@ export default function BrickCheckApp() {
                 <strong>{progress.found}<span> / {progress.required}</span></strong>
                 <small>pieces checked</small>
               </div>
-              <button className="secondary compact" onClick={() => exportSet(activeSet)}>↓ Save file</button>
+              <div className="progress-actions">
+                <button className="secondary compact" onClick={() => exportSet(activeSet)}>↓ Save file</button>
+                <button
+                  className="secondary compact bricklink-export"
+                  aria-label="Export missing parts as BrickLink Wanted List XML"
+                  title="Export missing parts as BrickLink Wanted List XML"
+                  disabled={exportingBrickLink || missingLots === 0}
+                  onClick={() => void exportMissingBrickLink()}
+                >
+                  {exportingBrickLink ? "Preparing…" : "↓ BrickLink XML"}
+                </button>
+              </div>
             </div>
           </section>
 

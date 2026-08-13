@@ -158,6 +158,10 @@ function inferRebrickableColorId(part: PartItem) {
   return Number.isFinite(inferred) ? inferred : undefined;
 }
 
+function rebrickableColorPartImage(partNum: string, colorId: number) {
+  return `https://cdn.rebrickable.com/media/parts/ldraw/${colorId}/${encodeURIComponent(partNum)}.png`;
+}
+
 function escapeXml(value: string) {
   return value
     .replaceAll("&", "&amp;")
@@ -496,12 +500,19 @@ function mapApiPart(raw: any, prefix = "part"): PartItem {
 
 function normaliseImportedSet(value: any): SavedSet | null {
   if (!value || typeof value !== "object" || !value.setNum || !value.name) return null;
+  const isMoc = /^MOC-\d+$/i.test(String(value.setNum));
   const parts = Array.isArray(value.parts)
-    ? value.parts.map((part: PartItem) => ({
-        ...part,
-        quantity: Math.max(Number(part.quantity) || 1, 1),
-        found: clamp(Number(part.found) || 0, 0, Math.max(Number(part.quantity) || 1, 1)),
-      }))
+    ? value.parts.map((part: PartItem) => {
+        const colorId = inferRebrickableColorId(part);
+        return {
+          ...part,
+          imageUrl: isMoc && colorId != null
+            ? rebrickableColorPartImage(part.partNum, colorId)
+            : part.imageUrl,
+          quantity: Math.max(Number(part.quantity) || 1, 1),
+          found: clamp(Number(part.found) || 0, 0, Math.max(Number(part.quantity) || 1, 1)),
+        };
+      })
     : [];
   const minifigs = Array.isArray(value.minifigs)
     ? value.minifigs.map((fig: MiniFig) => ({
@@ -882,13 +893,16 @@ export default function BrickCheckApp() {
         throw new Error(`Rebrickable could not match color ${unresolvedColors.slice(0, 3).join(", ")}.`);
       }
 
-      const parts = inventory.map((row) => mapApiPart({
-        id: `${reference.id}:${row.partNum}:${row.colorId}`,
-        part: partDetails.get(row.partNum),
-        color: colors.get(row.colorId),
-        quantity: row.quantity,
-        is_spare: row.spare,
-      }, reference.id));
+      const parts = inventory.map((row) => ({
+        ...mapApiPart({
+          id: `${reference.id}:${row.partNum}:${row.colorId}`,
+          part: partDetails.get(row.partNum),
+          color: colors.get(row.colorId),
+          quantity: row.quantity,
+          is_spare: row.spare,
+        }, reference.id),
+        imageUrl: rebrickableColorPartImage(row.partNum, row.colorId),
+      }));
       const now = new Date().toISOString();
       const coverImage = mocImageUrl.trim() || defaultMocImage(reference.id);
       const newSet: SavedSet = {

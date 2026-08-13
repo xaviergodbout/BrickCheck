@@ -162,6 +162,12 @@ function rebrickableColorPartImage(partNum: string, colorId: number) {
   return `https://cdn.rebrickable.com/media/parts/ldraw/${colorId}/${encodeURIComponent(partNum)}.png`;
 }
 
+function bricklinkColorPartImage(part: PartItem) {
+  const partNum = part.bricklinkPartNum ?? part.partNum;
+  if (!partNum || !Number.isFinite(part.bricklinkColorId)) return "";
+  return `https://img.bricklink.com/ItemImage/PN/${part.bricklinkColorId}/${encodeURIComponent(partNum)}.png`;
+}
+
 function escapeXml(value: string) {
   return value
     .replaceAll("&", "&amp;")
@@ -382,22 +388,28 @@ function relativeDate(dateString: string) {
 
 function PartVisual({
   src,
+  fallbackSrc,
   name,
   color,
   className = "",
 }: {
   src: string;
+  fallbackSrc?: string;
   name: string;
   color?: string;
   className?: string;
 }) {
   const anchorName = `--part-preview-${useId().replace(/[^a-z0-9]/gi, "")}`;
-  const [failed, setFailed] = useState(false);
+  const [failedSources, setFailedSources] = useState<string[]>([]);
   const [previewing, setPreviewing] = useState(false);
   const previewTimer = useRef<number | null>(null);
+  const sources = [src, fallbackSrc].filter((source, index, list): source is string => (
+    Boolean(source) && list.indexOf(source) === index
+  ));
+  const activeSrc = sources.find((source) => !failedSources.includes(source)) ?? "";
 
   const beginPreview = () => {
-    if (!src || failed) return;
+    if (!activeSrc) return;
     if (previewTimer.current) window.clearTimeout(previewTimer.current);
     previewTimer.current = window.setTimeout(() => setPreviewing(true), 1000);
   };
@@ -412,7 +424,7 @@ function PartVisual({
     if (previewTimer.current) window.clearTimeout(previewTimer.current);
   }, []);
 
-  if (!src || failed) {
+  if (!activeSrc) {
     return (
       <span className={`zoomable-image ${className}`}>
         <span
@@ -433,11 +445,19 @@ function PartVisual({
         onMouseEnter={beginPreview}
         onMouseLeave={endPreview}
       >
-        <img src={src} alt={name} loading="lazy" onError={() => setFailed(true)} />
+        <img
+          src={activeSrc}
+          alt={name}
+          loading="lazy"
+          onError={() => {
+            setPreviewing(false);
+            setFailedSources((current) => current.includes(activeSrc) ? current : [...current, activeSrc]);
+          }}
+        />
       </span>
       {previewing && createPortal(
         <span className="image-preview" role="presentation" style={{ positionAnchor: anchorName } as React.CSSProperties}>
-          <img src={src} alt="" />
+          <img src={activeSrc} alt="" />
         </span>,
         document.body,
       )}
@@ -1534,7 +1554,6 @@ export default function BrickCheckApp() {
               onClick={() => openGallery(activeSet.name, activeSet.setImages?.length ? activeSet.setImages : [activeSet.setImage], activeSet.setUrl)}
             >
               <PartVisual src={activeSet.setImage} name={activeSet.name} />
-              <span className="gallery-badge">View photo{activeSet.setImages?.length > 1 ? "s" : ""}</span>
             </button>
             <div className="set-title-block">
               <button className="back-link" onClick={() => setPage("sets")}>← My Sets</button>
@@ -1815,7 +1834,6 @@ export default function BrickCheckApp() {
                     <article key={`${result.kind}:${result.set_num}`}>
                       <button className="search-result-image" aria-label={`View ${result.name} photo`} onClick={() => openGallery(result.name, result.set_img_url ? [result.set_img_url] : [], result.set_url)}>
                         <PartVisual src={result.set_img_url} name={result.name} />
-                        <span>View photo</span>
                       </button>
                       <section>
                         <span>{result.set_num} · {result.year || "Unknown year"}</span>
@@ -2062,7 +2080,12 @@ function PartCard({ part, view, onFound }: { part: PartItem; view: ViewMode; onF
     >
       <button className="image-check" aria-label={complete ? `Mark ${part.name} missing` : `Mark ${part.name} found`} onClick={() => changeFound(complete ? 0 : part.quantity)}>{complete ? "✓" : ""}</button>
       <div className="part-image">
-        <PartVisual src={part.imageUrl} name={part.name} color={part.colorRgb} />
+        <PartVisual
+          src={part.imageUrl}
+          fallbackSrc={bricklinkColorPartImage(part)}
+          name={part.name}
+          color={part.colorRgb}
+        />
         {part.spare && <span className="spare-badge">SPARE</span>}
       </div>
       <div className="part-copy">

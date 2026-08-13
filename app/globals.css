@@ -228,19 +228,6 @@ button:focus-visible, input:focus-visible, a:focus-visible, [role="button"]:focu
   object-fit: contain;
   mix-blend-mode: normal;
 }
-.gallery-badge {
-  position: absolute;
-  right: 8px;
-  bottom: 8px;
-  padding: 4px 7px;
-  border: 1px solid var(--line-dark);
-  border-radius: 2px;
-  background: rgba(255,255,255,.92);
-  color: var(--ink);
-  font-size: 9px;
-  font-weight: 700;
-}
-
 .complete-badge, .spare-badge {
   position: absolute;
   z-index: 3;
@@ -1042,17 +1029,6 @@ button:focus-visible, input:focus-visible, a:focus-visible, [role="button"]:focu
   border-radius: 2px;
   background: #f7f9fb;
   cursor: zoom-in;
-}
-.search-result-image > span {
-  position: absolute;
-  right: 5px;
-  bottom: 5px;
-  padding: 3px 5px;
-  border: 1px solid var(--line-dark);
-  background: rgba(255,255,255,.92);
-  color: #171717;
-  font-size: 8px;
-  font-weight: 700;
 }
 .search-results article section { min-width: 0; flex: 1; }
 .search-results article section span { color: var(--muted); font-family: var(--font-geist-mono), Consolas, monospace; font-size: 9px; }

@@ -19,7 +19,7 @@ type ThemeMode = "light" | "dark";
 type SortMode = "part" | "quantity" | "size";
 type SortDirection = "asc" | "desc";
 type GroupMode = "none" | "color" | "status";
-type SearchKind = "all" | "sets" | "minifigs" | "polybag" | "brickheadz";
+type SearchKind = "all" | "sets" | "minifigs" | "polybag" | "brickheadz" | "mocs";
 type SearchSort = "relevance" | "date_desc" | "date_asc" | "pieces_desc" | "pieces_asc";
 
 type PartItem = {
@@ -90,6 +90,19 @@ type BrickLinkXmlState = {
   pieceCount: number;
 };
 
+type MocReference = {
+  id: string;
+  pageUrl: string;
+  suggestedName: string;
+};
+
+type MocInventoryRow = {
+  partNum: string;
+  colorId: number;
+  quantity: number;
+  spare: boolean;
+};
+
 type MissingPart = {
   part: PartItem;
   quantity: number;
@@ -152,6 +165,103 @@ function escapeXml(value: string) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
+}
+
+function parseMocReference(value: string): MocReference | null {
+  const trimmed = value.trim();
+  const match = trimmed.match(/\bMOC-(\d+)\b/i);
+  if (!match) return null;
+  const id = `MOC-${match[1]}`;
+  let pageUrl = `https://rebrickable.com/mocs/${id}/`;
+  let suggestedName = `Custom ${id}`;
+
+  try {
+    const url = new URL(trimmed);
+    if (!/(^|\.)rebrickable\.com$/i.test(url.hostname) || !/\/mocs\//i.test(url.pathname)) return null;
+    pageUrl = `${url.origin}${url.pathname}`;
+    const segments = url.pathname.split("/").filter(Boolean);
+    const mocIndex = segments.findIndex((segment) => segment.toUpperCase() === id);
+    const slug = mocIndex >= 0 ? segments[mocIndex + 2] : undefined;
+    if (slug) {
+      const decoded = decodeURIComponent(slug).replace(/[-_]+/g, " ").trim();
+      suggestedName = decoded ? decoded[0].toUpperCase() + decoded.slice(1) : suggestedName;
+    }
+  } catch {
+    // Plain MOC IDs (including surrounding punctuation) are valid references.
+  }
+
+  return { id, pageUrl, suggestedName };
+}
+
+function parseCsvRows(source: string) {
+  const firstLine = source.split(/\r?\n/).find((line) => line.trim()) ?? "";
+  const delimiters = [",", ";", "\t"];
+  const delimiter = delimiters.sort((a, b) => firstLine.split(b).length - firstLine.split(a).length)[0];
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === '"') {
+      if (quoted && source[index + 1] === '"') {
+        cell += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (character === delimiter && !quoted) {
+      row.push(cell.trim());
+      cell = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && source[index + 1] === "\n") index += 1;
+      row.push(cell.trim());
+      if (row.some(Boolean)) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  row.push(cell.trim());
+  if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
+
+function parseMocInventoryCsv(source: string): MocInventoryRow[] {
+  const rows = parseCsvRows(source.replace(/^\uFEFF/, ""));
+  if (rows.length < 2) throw new Error("That CSV does not contain a parts inventory.");
+  const headers = rows[0].map((header) => header.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim());
+  const findColumn = (...aliases: string[]) => headers.findIndex((header) => aliases.includes(header));
+  const partIndex = findColumn("part", "part num", "part number", "part id", "partnum");
+  const colorIndex = findColumn("color", "colour", "color id", "colour id", "colorid");
+  const quantityIndex = findColumn("quantity", "qty", "count");
+  const spareIndex = findColumn("is spare", "spare", "is extra", "extra");
+  if (partIndex < 0 || colorIndex < 0 || quantityIndex < 0) {
+    throw new Error("Use Rebrickable CSV format with Part, Color and Quantity columns.");
+  }
+
+  const grouped = new Map<string, MocInventoryRow>();
+  rows.slice(1).forEach((values) => {
+    const partNum = values[partIndex]?.trim();
+    const colorId = Number(values[colorIndex]);
+    const quantity = Number(values[quantityIndex]);
+    if (!partNum || !Number.isFinite(colorId) || !Number.isFinite(quantity) || quantity <= 0) return;
+    const spareValue = spareIndex >= 0 ? values[spareIndex]?.trim().toLowerCase() : "";
+    const spare = ["true", "yes", "y", "1"].includes(spareValue);
+    const key = `${partNum}:${colorId}:${spare ? 1 : 0}`;
+    const existing = grouped.get(key);
+    grouped.set(key, { partNum, colorId, quantity: (existing?.quantity ?? 0) + Math.floor(quantity), spare });
+  });
+  const inventory = Array.from(grouped.values());
+  if (!inventory.length) throw new Error("No valid parts were found in that CSV.");
+  return inventory;
+}
+
+function defaultMocImage(mocId: string) {
+  const number = mocId.replace(/^MOC-/i, "");
+  return `https://cdn.rebrickable.com/media/thumbs/mocs/moc-${number}.jpg/1000x800p.jpg`;
 }
 
 function isBrickBuiltSet(result: SearchResult) {
@@ -449,8 +559,17 @@ export default function BrickCheckApp() {
   const [error, setError] = useState("");
   const [exportingBrickLink, setExportingBrickLink] = useState(false);
   const [bricklinkXml, setBricklinkXml] = useState<BrickLinkXmlState | null>(null);
+  const [mocOpen, setMocOpen] = useState(false);
+  const [mocReferenceInput, setMocReferenceInput] = useState("");
+  const [mocName, setMocName] = useState("");
+  const [mocImageUrl, setMocImageUrl] = useState("");
+  const [mocInventoryText, setMocInventoryText] = useState("");
+  const [mocInventoryFileName, setMocInventoryFileName] = useState("");
+  const [mocImporting, setMocImporting] = useState(false);
+  const [mocError, setMocError] = useState("");
   const [hydrated, setHydrated] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
+  const mocInventoryRef = useRef<HTMLInputElement>(null);
   const bricklinkXmlRef = useRef<HTMLTextAreaElement>(null);
   const searchRequestRef = useRef(0);
   const themeMapRef = useRef<Map<number, string>>(new Map());
@@ -462,7 +581,7 @@ export default function BrickCheckApp() {
       const safeSets = Array.isArray(storedSets)
         ? storedSets
             .map(normaliseImportedSet)
-            .filter((set): set is SavedSet => Boolean(set) && !set.id.startsWith("demo-"))
+            .filter((set): set is SavedSet => set !== null && !set.id.startsWith("demo-"))
         : [];
       setSets(safeSets);
       setActiveId(safeSets[0]?.id ?? "");
@@ -514,8 +633,19 @@ export default function BrickCheckApp() {
 
   const activeSet = sets.find((set) => set.id === activeId) ?? sets[0];
   const progress = activeSet ? getProgress(activeSet) : { required: 0, found: 0, percent: 0 };
+  const mocCandidate = parseMocReference(searchQuery);
+  const mocDraftReference = parseMocReference(mocReferenceInput);
+  const mocInventoryLotCount = useMemo(() => {
+    if (!mocInventoryText.trim()) return 0;
+    try {
+      return parseMocInventoryCsv(mocInventoryText).length;
+    } catch {
+      return 0;
+    }
+  }, [mocInventoryText]);
   const visibleSearchResults = useMemo(() => {
     const filtered = searchResults.filter((result) => {
+      if (searchKind === "mocs") return false;
       if (searchKind === "minifigs") return result.kind === "minifig";
       if (searchKind === "sets") return result.kind === "set";
       if (searchKind === "polybag") return result.kind === "set" && isPolybagResult(result);
@@ -655,9 +785,150 @@ export default function BrickCheckApp() {
     setNotice(key ? "Rebrickable connected" : "API key removed");
   };
 
+  const openMocImporter = (referenceValue = searchQuery) => {
+    const reference = parseMocReference(referenceValue);
+    setMocReferenceInput(referenceValue.trim());
+    setMocName(reference?.suggestedName ?? "");
+    setMocImageUrl(reference ? defaultMocImage(reference.id) : "");
+    setMocInventoryText("");
+    setMocInventoryFileName("");
+    setMocError(referenceValue.trim() && !reference ? "Enter a Rebrickable MOC URL or an ID such as MOC-262378." : "");
+    setMocOpen(true);
+  };
+
+  const readMocInventoryFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      parseMocInventoryCsv(text);
+      setMocInventoryText(text);
+      setMocInventoryFileName(file.name);
+      setMocError("");
+    } catch (fileError) {
+      setMocInventoryText("");
+      setMocInventoryFileName("");
+      setMocError(fileError instanceof Error ? fileError.message : "Could not read that inventory CSV.");
+    }
+  };
+
+  const importMoc = async () => {
+    const reference = parseMocReference(mocReferenceInput);
+    if (!reference) {
+      setMocError("Enter a Rebrickable MOC URL or an ID such as MOC-262378.");
+      return;
+    }
+    if (!mocName.trim()) {
+      setMocError("Give this MOC a name.");
+      return;
+    }
+    if (!mocInventoryText.trim()) {
+      setMocError("Add the Rebrickable CSV from the MOC inventory page.");
+      return;
+    }
+    if (!apiKey) {
+      setMocError("Connect Rebrickable first so BrickCheck can load the part names, colors and images.");
+      setApiDraft(apiKey);
+      setSettingsOpen(true);
+      return;
+    }
+
+    const existing = sets.find((set) => set.setNum.toUpperCase() === reference.id);
+    if (existing) {
+      setActiveId(existing.id);
+      setPage("check");
+      setSearchOpen(false);
+      setMocOpen(false);
+      setNotice("Opened your saved MOC check");
+      return;
+    }
+
+    setMocImporting(true);
+    setMocError("");
+    try {
+      const inventory = parseMocInventoryCsv(mocInventoryText);
+      const partNums = Array.from(new Set(inventory.map((row) => row.partNum)));
+      const [rawColors, ...partGroups] = await Promise.all([
+        rebrickableList("/lego/colors/?page_size=1000", apiKey),
+        ...Array.from({ length: Math.ceil(partNums.length / 150) }, (_, batchIndex) => {
+          const batch = partNums.slice(batchIndex * 150, batchIndex * 150 + 150);
+          return rebrickableList(
+            `/lego/parts/?part_nums=${encodeURIComponent(batch.join(","))}&inc_part_details=1&page_size=1000`,
+            apiKey,
+          );
+        }),
+      ]);
+
+      const colors = new Map<number, Record<string, unknown>>();
+      rawColors.forEach((value) => {
+        const color = value as Record<string, unknown>;
+        const colorId = Number(color.id);
+        if (Number.isFinite(colorId)) colors.set(colorId, color);
+      });
+      const partDetails = new Map<string, Record<string, unknown>>();
+      partGroups.flat().forEach((value) => {
+        const part = value as Record<string, unknown>;
+        const partNum = String(part.part_num ?? "");
+        if (partNum) partDetails.set(partNum, part);
+      });
+
+      const unresolvedParts = partNums.filter((partNum) => !partDetails.has(partNum));
+      const unresolvedColors = Array.from(new Set(inventory.map((row) => row.colorId))).filter((colorId) => !colors.has(colorId));
+      if (unresolvedParts.length) {
+        throw new Error(`Rebrickable could not match ${unresolvedParts.slice(0, 3).join(", ")}${unresolvedParts.length > 3 ? "…" : ""}.`);
+      }
+      if (unresolvedColors.length) {
+        throw new Error(`Rebrickable could not match color ${unresolvedColors.slice(0, 3).join(", ")}.`);
+      }
+
+      const parts = inventory.map((row) => mapApiPart({
+        id: `${reference.id}:${row.partNum}:${row.colorId}`,
+        part: partDetails.get(row.partNum),
+        color: colors.get(row.colorId),
+        quantity: row.quantity,
+        is_spare: row.spare,
+      }, reference.id));
+      const now = new Date().toISOString();
+      const coverImage = mocImageUrl.trim() || defaultMocImage(reference.id);
+      const newSet: SavedSet = {
+        id: `${reference.id}-${Date.now()}`,
+        setNum: reference.id,
+        name: mocName.trim(),
+        year: new Date().getFullYear(),
+        theme: "Rebrickable MOC",
+        setImage: coverImage,
+        setImages: coverImage ? [coverImage] : [],
+        setUrl: reference.pageUrl,
+        catalogParts: inventory.filter((row) => !row.spare).reduce((total, row) => total + row.quantity, 0),
+        parts,
+        minifigs: [],
+        minifigMode: "assembled",
+        createdAt: now,
+        updatedAt: now,
+      };
+      setSets((current) => [newSet, ...current]);
+      setActiveId(newSet.id);
+      setPage("check");
+      setMocOpen(false);
+      setSearchOpen(false);
+      setNotice(`${reference.id} added to My Sets`);
+    } catch (importError) {
+      setMocError(importError instanceof Error ? importError.message : "Could not import that MOC inventory.");
+    } finally {
+      setMocImporting(false);
+    }
+  };
+
   const performSearch = async (queryValue: string, manual = false) => {
     const query = queryValue.trim();
     if ((!manual && query.length < 2) || !query) return;
+    if (parseMocReference(query) || searchKind === "mocs") {
+      setSearchResults([]);
+      setSearching(false);
+      setError(manual && !parseMocReference(query) ? "Enter a MOC ID or paste its Rebrickable URL." : "");
+      return;
+    }
     if (!apiKey) {
       if (manual) {
         setSettingsOpen(true);
@@ -756,12 +1027,23 @@ export default function BrickCheckApp() {
 
   const searchSets = (event?: FormEvent) => {
     event?.preventDefault();
+    if (parseMocReference(searchQuery)) {
+      openMocImporter(searchQuery);
+      return;
+    }
     void performSearch(searchQuery, true);
   };
 
   useEffect(() => {
     if (!searchOpen) return;
     const query = searchQuery.trim();
+    if (parseMocReference(query) || searchKind === "mocs") {
+      searchRequestRef.current += 1;
+      setSearchResults([]);
+      setSearching(false);
+      setError("");
+      return;
+    }
     if (query.length < 2) {
       searchRequestRef.current += 1;
       setSearchResults([]);
@@ -1075,14 +1357,14 @@ export default function BrickCheckApp() {
     if (!file) return;
     try {
       const data = JSON.parse(await file.text());
-      const incomingValues = Array.isArray(data?.sets)
+      const incomingValues: unknown[] = Array.isArray(data?.sets)
         ? data.sets
         : data?.setNum
           ? [data]
           : [];
       const incoming = incomingValues
         .map(normaliseImportedSet)
-        .filter((set): set is SavedSet => Boolean(set) && !set.id.startsWith("demo-"));
+        .filter((set): set is SavedSet => set !== null && !set.id.startsWith("demo-"));
       if (!incoming.length) throw new Error("No BrickCheck sets were found in that file.");
       setSets((current) => {
         const merged = [...current];
@@ -1457,12 +1739,12 @@ export default function BrickCheckApp() {
           <section className={`search-modal ${searchResults.length ? "has-results" : ""}`} role="dialog" aria-modal="true" aria-labelledby="search-title">
             <button className="modal-close" aria-label="Close" onClick={() => setSearchOpen(false)}>×</button>
             <p className="eyebrow">NEW BRICKCHECK</p>
-            <h2 id="search-title">Which set is in the bin?</h2>
-            <p>Start typing a set number or name. Suggestions update automatically.</p>
+            <h2 id="search-title">Which build is in the bin?</h2>
+            <p>Search LEGO sets, or paste a Rebrickable MOC URL or ID.</p>
             <form className="big-search" onSubmit={searchSets}>
               <span aria-hidden="true">⌕</span>
-              <input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Try 75379 or Batman" />
-              <button disabled={searching}>{searching ? "Searching…" : "Search"}</button>
+              <input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Try 75379, Batman or MOC-262378" />
+              <button disabled={searching}>{searching ? "Searching…" : mocCandidate ? "Import MOC" : "Search"}</button>
             </form>
             <div className="search-controls">
               <div className="search-kind-tabs" role="group" aria-label="Catalog type">
@@ -1472,11 +1754,12 @@ export default function BrickCheckApp() {
                   ["minifigs", "Minifigs"],
                   ["polybag", "Polybags"],
                   ["brickheadz", "BrickHeadz"],
+                  ["mocs", "Custom MOCs"],
                 ] as [SearchKind, string][]).map(([value, label]) => (
                   <button type="button" className={searchKind === value ? "active" : ""} key={value} onClick={() => setSearchKind(value)}>{label}</button>
                 ))}
               </div>
-              <label className="search-sort">
+              {searchKind !== "mocs" && <label className="search-sort">
                 <span>Sort</span>
                 <select value={searchSort} onChange={(event) => setSearchSort(event.target.value as SearchSort)}>
                   <option value="relevance">Best match</option>
@@ -1485,10 +1768,24 @@ export default function BrickCheckApp() {
                   <option value="pieces_desc">Piece count: high to low</option>
                   <option value="pieces_asc">Piece count: low to high</option>
                 </select>
-              </label>
+              </label>}
             </div>
             {error && <div className="inline-error">{error}</div>}
-            <p className="search-filter-note">LEGO sets and minifigures only. Books, costumes, clips, videos, and zero-part entries are hidden.</p>
+            {mocCandidate && (
+              <div className="moc-detected-card">
+                <div className="moc-detected-mark">MOC</div>
+                <div><span>REBRICKABLE CUSTOM BUILD</span><strong>{mocCandidate.id}</strong><small>{mocCandidate.suggestedName}</small></div>
+                <button type="button" className="primary small" onClick={() => openMocImporter(searchQuery)}>Import inventory</button>
+              </div>
+            )}
+            {searchKind === "mocs" && !mocCandidate && (
+              <div className="moc-help-card">
+                <div><span>MOC</span></div>
+                <p><strong>Add a custom Rebrickable MOC</strong><small>Paste its page URL or ID above, then add the inventory CSV exported by Rebrickable.</small></p>
+                <button type="button" onClick={() => openMocImporter()}>Import MOC</button>
+              </div>
+            )}
+            <p className="search-filter-note">Official results hide books, costumes, clips, videos, and zero-part entries. Custom MOCs are imported separately.</p>
             {!apiKey && (
               <div className="source-callout">
                 <div><span>R</span></div>
@@ -1517,6 +1814,65 @@ export default function BrickCheckApp() {
                 </div>
               </>
             )}
+          </section>
+        </div>
+      )}
+
+      {mocOpen && (
+        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !mocImporting) setMocOpen(false); }}>
+          <section className="moc-modal" role="dialog" aria-modal="true" aria-labelledby="moc-import-title">
+            <button className="modal-close" aria-label="Close MOC importer" disabled={mocImporting} onClick={() => setMocOpen(false)}>×</button>
+            <p className="eyebrow">CUSTOM BRICKCHECK</p>
+            <h2 id="moc-import-title">Import a Rebrickable MOC</h2>
+            <p className="moc-modal-intro">Identify the MOC, then add its Rebrickable CSV inventory. BrickCheck will retrieve the part names, colors and images.</p>
+
+            <div className="moc-form-grid">
+              <label className="moc-field moc-reference-field">
+                <span>Rebrickable URL or MOC ID</span>
+                <input
+                  value={mocReferenceInput}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    const reference = parseMocReference(value);
+                    setMocReferenceInput(value);
+                    if (reference) {
+                      setMocName((current) => current || reference.suggestedName);
+                      setMocImageUrl((current) => current || defaultMocImage(reference.id));
+                      setMocError("");
+                    }
+                  }}
+                  placeholder="MOC-262378 or https://rebrickable.com/mocs/…"
+                />
+              </label>
+              <label className="moc-field">
+                <span>MOC name</span>
+                <input value={mocName} onChange={(event) => setMocName(event.target.value)} placeholder="The Batpod LOTDK" />
+              </label>
+              <label className="moc-field">
+                <span>Cover image URL <small>Optional</small></span>
+                <input value={mocImageUrl} onChange={(event) => setMocImageUrl(event.target.value)} placeholder="Rebrickable image address" />
+              </label>
+            </div>
+
+            <section className={`moc-inventory-drop ${mocInventoryText ? "has-file" : ""}`}>
+              <input ref={mocInventoryRef} className="hidden-input" type="file" accept=".csv,text/csv" onChange={readMocInventoryFile} />
+              <div className="moc-file-mark">CSV</div>
+              <div>
+                <strong>{mocInventoryFileName || "Add the MOC inventory"}</strong>
+                <span>{mocInventoryText ? (mocInventoryLotCount ? `${mocInventoryLotCount} part lots ready` : "CSV added — import to validate") : "On Rebrickable, open the MOC inventory and export it as Rebrickable CSV."}</span>
+              </div>
+              <button type="button" className="secondary compact" disabled={mocImporting} onClick={() => mocInventoryRef.current?.click()}>{mocInventoryText ? "Replace CSV" : "Choose CSV"}</button>
+            </section>
+
+            <details className="moc-paste-details">
+              <summary>Or paste the CSV contents</summary>
+              <textarea value={mocInventoryText} onChange={(event) => { setMocInventoryText(event.target.value); setMocInventoryFileName(""); setMocError(""); }} placeholder={'Part,Color,Quantity,Is Spare\n3001,0,4,False'} spellCheck={false} />
+            </details>
+            {mocError && <div className="inline-error">{mocError}</div>}
+            <div className="moc-actions">
+              {mocDraftReference && <a href={mocDraftReference.pageUrl} target="_blank" rel="noreferrer">Open MOC on Rebrickable ↗</a>}
+              <button className="primary" disabled={mocImporting} onClick={() => void importMoc()}>{mocImporting ? "Loading parts…" : "Add to My Sets"}</button>
+            </div>
           </section>
         </div>
       )}

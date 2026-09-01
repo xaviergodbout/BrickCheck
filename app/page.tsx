@@ -10,6 +10,13 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import type { User } from "@supabase/supabase-js";
+import {
+  getSupabaseClient,
+  isAccountSyncConfigured,
+  normaliseUsername,
+  usernameToEmail,
+} from "@/lib/supabase";
 
 type ViewMode = "grid" | "list";
 type FilterMode = "all" | "missing" | "found" | "minifigs";
@@ -112,6 +119,22 @@ type BrickLinkColorMaps = {
   byRebrickableId: Map<number, number>;
   byName: Map<string, number>;
   byRgb: Map<string, number>;
+};
+
+type BrickCheckAccount = {
+  userId: string;
+  username: string;
+};
+
+type AccountSyncStatus = "idle" | "loading" | "syncing" | "saved" | "error";
+
+type CloudAccountRow = {
+  user_id: string;
+  username: string;
+  sets: unknown;
+  api_key: string | null;
+  active_set_id: string | null;
+  updated_at: string;
 };
 
 const STORAGE_KEY = "brickcheck:sets:v1";
@@ -558,8 +581,46 @@ function normaliseImportedSet(value: any): SavedSet | null {
     minifigs,
     minifigMode: value.minifigMode === "parts" ? "parts" : "assembled",
     createdAt: value.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    updatedAt: value.updatedAt || new Date().toISOString(),
   } as SavedSet;
+}
+
+function normaliseSavedSets(values: unknown): SavedSet[] {
+  return Array.isArray(values)
+    ? values
+        .map(normaliseImportedSet)
+        .filter((set): set is SavedSet => set !== null && !set.id.startsWith("demo-"))
+    : [];
+}
+
+function mergeSavedSets(localSets: SavedSet[], cloudSets: SavedSet[]) {
+  const merged = new Map<string, SavedSet>();
+  [...localSets, ...cloudSets].forEach((set) => {
+    const key = set.setNum.trim().toUpperCase();
+    const current = merged.get(key);
+    if (!current || new Date(set.updatedAt).getTime() > new Date(current.updatedAt).getTime()) {
+      merged.set(key, set);
+    }
+  });
+  return Array.from(merged.values());
+}
+
+function validateUsername(value: string) {
+  const username = normaliseUsername(value);
+  if (!/^[a-z0-9_-]{3,30}$/.test(username)) {
+    throw new Error("Use 3–30 letters, numbers, underscores or hyphens for the username.");
+  }
+  return username;
+}
+
+function friendlyAccountError(error: unknown, creating = false) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/invalid login credentials/i.test(message)) return "That username or password is incorrect.";
+  if (/already registered|already exists|duplicate/i.test(message)) return "That username is already taken.";
+  if (/password should be at least/i.test(message)) return "Use a password with at least 6 characters.";
+  if (/email.*confirm|confirmation/i.test(message)) return "Account creation is waiting for email confirmation. Turn off Confirm email in Supabase Auth settings.";
+  if (/brickcheck_accounts|relation.*does not exist/i.test(message)) return "Account storage is not ready yet. Run the included Supabase setup SQL first.";
+  return message || (creating ? "Could not create that account." : "Could not sign in.");
 }
 
 export default function BrickCheckApp() {
@@ -576,6 +637,15 @@ export default function BrickCheckApp() {
   const [partQuery, setPartQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [account, setAccount] = useState<BrickCheckAccount | null>(null);
+  const [accountUsername, setAccountUsername] = useState("");
+  const [accountPassword, setAccountPassword] = useState("");
+  const [accountError, setAccountError] = useState("");
+  const [accountBusy, setAccountBusy] = useState(false);
+  const [accountReady, setAccountReady] = useState(false);
+  const [accountSyncReady, setAccountSyncReady] = useState(false);
+  const [accountSyncStatus, setAccountSyncStatus] = useState<AccountSyncStatus>("idle");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -604,16 +674,76 @@ export default function BrickCheckApp() {
   const bricklinkXmlRef = useRef<HTMLTextAreaElement>(null);
   const searchRequestRef = useRef(0);
   const themeMapRef = useRef<Map<number, string>>(new Map());
+  const accountConfigured = isAccountSyncConfigured();
+
+  const saveCloudSnapshot = async (
+    currentAccount: BrickCheckAccount,
+    snapshotSets = sets,
+    snapshotApiKey = apiKey,
+    snapshotActiveId = activeId,
+  ) => {
+    const client = getSupabaseClient();
+    if (!client) throw new Error("Account sync has not been configured for this deployment.");
+    const { error: syncError } = await client
+      .from("brickcheck_accounts")
+      .upsert({
+        user_id: currentAccount.userId,
+        username: currentAccount.username,
+        sets: snapshotSets,
+        api_key: snapshotApiKey,
+        active_set_id: snapshotActiveId,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "user_id" });
+    if (syncError) throw syncError;
+  };
+
+  const loadCloudAccount = async (user: User, requestedUsername?: string) => {
+    const client = getSupabaseClient();
+    if (!client) throw new Error("Account sync has not been configured for this deployment.");
+    setAccountSyncReady(false);
+    setAccountSyncStatus("loading");
+
+    const { data, error: loadError } = await client
+      .from("brickcheck_accounts")
+      .select("user_id, username, sets, api_key, active_set_id, updated_at")
+      .eq("user_id", user.id)
+      .maybeSingle<CloudAccountRow>();
+    if (loadError) throw loadError;
+
+    const username = normaliseUsername(
+      data?.username
+        || requestedUsername
+        || String(user.user_metadata?.username ?? "")
+        || user.email?.split("@")[0]
+        || "brickcheck-user",
+    );
+    const cloudSets = normaliseSavedSets(data?.sets);
+    const mergedSets = mergeSavedSets(sets, cloudSets);
+    const mergedApiKey = data?.api_key || apiKey;
+    const preferredActiveId = data?.active_set_id || activeId;
+    const mergedActiveId = mergedSets.some((set) => set.id === preferredActiveId)
+      ? preferredActiveId
+      : mergedSets[0]?.id ?? "";
+    const nextAccount = { userId: user.id, username };
+
+    await saveCloudSnapshot(nextAccount, mergedSets, mergedApiKey, mergedActiveId);
+    setSets(mergedSets);
+    setApiKey(mergedApiKey);
+    setApiDraft(mergedApiKey);
+    setActiveId(mergedActiveId);
+    setAccount(nextAccount);
+    setAccountUsername(username);
+    localStorage.setItem(API_KEY_STORAGE, mergedApiKey);
+    if (!mergedSets.length) setPage("sets");
+    setAccountSyncReady(true);
+    setAccountSyncStatus("saved");
+  };
 
   useEffect(() => {
     try {
       const rawSets = localStorage.getItem(STORAGE_KEY);
       const storedSets = rawSets ? (JSON.parse(rawSets) as SavedSet[]) : [];
-      const safeSets = Array.isArray(storedSets)
-        ? storedSets
-            .map(normaliseImportedSet)
-            .filter((set): set is SavedSet => set !== null && !set.id.startsWith("demo-"))
-        : [];
+      const safeSets = normaliseSavedSets(storedSets);
       setSets(safeSets);
       setActiveId(safeSets[0]?.id ?? "");
       if (!safeSets.length) setPage("sets");
@@ -648,8 +778,49 @@ export default function BrickCheckApp() {
 
   useEffect(() => {
     if (!hydrated) return;
+    const client = getSupabaseClient();
+    if (!client) {
+      const readyTimer = window.setTimeout(() => setAccountReady(true), 0);
+      return () => window.clearTimeout(readyTimer);
+    }
+    let cancelled = false;
+    void client.auth.getUser().then(async ({ data, error: sessionError }) => {
+      if (cancelled) return;
+      if (sessionError || !data.user) {
+        setAccountReady(true);
+        return;
+      }
+      try {
+        await loadCloudAccount(data.user);
+      } catch (restoreError) {
+        setAccountSyncStatus("error");
+        setAccountError(restoreError instanceof Error ? restoreError.message : "Could not load your account.");
+      } finally {
+        if (!cancelled) setAccountReady(true);
+      }
+    });
+    return () => { cancelled = true; };
+    // Account restoration should only run once after local state has loaded.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) return;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(sets));
   }, [sets, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated || !account || !accountSyncReady) return;
+    const timer = window.setTimeout(() => {
+      setAccountSyncStatus("syncing");
+      void saveCloudSnapshot(account)
+        .then(() => setAccountSyncStatus("saved"))
+        .catch(() => setAccountSyncStatus("error"));
+    }, 900);
+    return () => window.clearTimeout(timer);
+    // saveCloudSnapshot intentionally captures the current snapshot values.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sets, apiKey, activeId, account, accountSyncReady, hydrated]);
 
   useEffect(() => {
     if (!notice) return;
@@ -814,6 +985,98 @@ export default function BrickCheckApp() {
     localStorage.setItem(API_KEY_STORAGE, key);
     setSettingsOpen(false);
     setNotice(key ? "Rebrickable connected" : "API key removed");
+  };
+
+  const openAccount = () => {
+    setAccountUsername(account?.username ?? "");
+    setAccountPassword("");
+    setAccountError("");
+    setAccountOpen(true);
+    setMobileMenuOpen(false);
+  };
+
+  const authenticateAccount = async (creating: boolean) => {
+    if (!accountConfigured) {
+      setAccountError("Account sync has not been configured for this deployment yet.");
+      return;
+    }
+    setAccountBusy(true);
+    setAccountError("");
+    try {
+      const username = validateUsername(accountUsername);
+      if (accountPassword.length < 6) throw new Error("Use a password with at least 6 characters.");
+      const client = getSupabaseClient();
+      if (!client) throw new Error("Account sync has not been configured for this deployment yet.");
+
+      const result = creating
+        ? await client.auth.signUp({
+            email: usernameToEmail(username),
+            password: accountPassword,
+            options: { data: { username } },
+          })
+        : await client.auth.signInWithPassword({
+            email: usernameToEmail(username),
+            password: accountPassword,
+          });
+      if (result.error) throw result.error;
+      if (!result.data.user || !result.data.session) {
+        throw new Error("Account creation is waiting for email confirmation.");
+      }
+
+      await loadCloudAccount(result.data.user, username);
+      setAccountPassword("");
+      setAccountOpen(false);
+      setAccountReady(true);
+      setNotice(creating ? `Account ${username} created and synced` : `Signed in as ${username}`);
+    } catch (authError) {
+      setAccountError(friendlyAccountError(authError, creating));
+      setAccountSyncStatus("error");
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const submitAccountLogin = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void authenticateAccount(false);
+  };
+
+  const syncAccountNow = async () => {
+    if (!account) return;
+    setAccountBusy(true);
+    setAccountSyncStatus("syncing");
+    setAccountError("");
+    try {
+      await saveCloudSnapshot(account);
+      setAccountSyncStatus("saved");
+      setNotice("Account is up to date");
+    } catch (syncError) {
+      setAccountSyncStatus("error");
+      setAccountError(friendlyAccountError(syncError));
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const signOutAccount = async () => {
+    const client = getSupabaseClient();
+    setAccountBusy(true);
+    setAccountError("");
+    try {
+      if (account) await saveCloudSnapshot(account);
+      const { error: signOutError } = client ? await client.auth.signOut() : { error: null };
+      if (signOutError) throw signOutError;
+      setAccount(null);
+      setAccountSyncReady(false);
+      setAccountSyncStatus("idle");
+      setAccountPassword("");
+      setAccountOpen(false);
+      setNotice("Signed out — this device keeps its local copy");
+    } catch (signOutError) {
+      setAccountError(friendlyAccountError(signOutError));
+    } finally {
+      setAccountBusy(false);
+    }
   };
 
   const openMocImporter = (referenceValue = searchQuery) => {
@@ -1466,6 +1729,14 @@ export default function BrickCheckApp() {
           <span>Find a set by name or number</span>
         </button>
         <div className="top-actions">
+          <button
+            className={`icon-button account-button ${account ? "signed-in" : ""}`}
+            aria-label={account ? `Account: ${account.username}` : "Sign in to sync BrickCheck"}
+            title={account ? `Signed in as ${account.username}` : "Account sync"}
+            onClick={openAccount}
+          >
+            <span>{!accountReady && accountConfigured ? "…" : account ? account.username.slice(0, 1).toUpperCase() : "@"}</span>
+          </button>
           <button className="icon-button" aria-label="Rebrickable settings" onClick={() => { setApiDraft(apiKey); setSettingsOpen(true); }}>⚙</button>
           <button className="primary small new-check-button" aria-label="Start a new check" onClick={() => setSearchOpen(true)}><span aria-hidden="true">＋</span><span className="new-check-label">New check</span></button>
           <button
@@ -1481,6 +1752,7 @@ export default function BrickCheckApp() {
           <div className="mobile-menu">
             <button onClick={() => { setPage("check"); setMobileMenuOpen(false); }}>Workbench</button>
             <button onClick={() => { setPage("sets"); setMobileMenuOpen(false); }}>My Sets <span>{sets.length}</span></button>
+            <button onClick={openAccount}>{account ? `Account: ${account.username}` : "Sign in & sync"}</button>
             <button onClick={() => { setApiDraft(apiKey); setSettingsOpen(true); setMobileMenuOpen(false); }}>Settings &amp; API</button>
           </div>
         )}
@@ -1494,7 +1766,7 @@ export default function BrickCheckApp() {
             <div>
               <p className="eyebrow">YOUR COLLECTION</p>
               <h1>My Sets</h1>
-              <p>Every active parts check, saved automatically on this device.</p>
+              <p>{account ? `Synced to ${account.username} and saved on this device.` : "Every active parts check, saved automatically on this device."}</p>
             </div>
             <div className="heading-actions">
               <div className="view-switch sets-view-switch" role="group" aria-label="My Sets view style">
@@ -1909,6 +2181,74 @@ export default function BrickCheckApp() {
         </div>
       )}
 
+      {accountOpen && (
+        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !accountBusy) setAccountOpen(false); }}>
+          <section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="account-title">
+            <button className="modal-close" aria-label="Close account" disabled={accountBusy} onClick={() => setAccountOpen(false)}>×</button>
+            <div className="account-mark">{account ? account.username.slice(0, 1).toUpperCase() : "@"}</div>
+            <p className="eyebrow">BRICKCHECK ACCOUNT</p>
+            <h2 id="account-title">{account ? account.username : "Sign in to sync"}</h2>
+
+            {!accountConfigured ? (
+              <div className="account-setup-note">
+                <strong>Account sync needs its one-time setup.</strong>
+                <span>Add the Supabase project values during your GitHub Pages build, then redeploy.</span>
+              </div>
+            ) : account ? (
+              <div className="account-signed-in">
+                <p>Your sets, progress and Rebrickable API key are linked to this account.</p>
+                <div className={`sync-state ${accountSyncStatus}`}>
+                  <span aria-hidden="true" />
+                  <strong>{accountSyncStatus === "syncing" || accountSyncStatus === "loading"
+                    ? "Syncing…"
+                    : accountSyncStatus === "error"
+                      ? "Sync needs attention"
+                      : "Everything is synced"}</strong>
+                </div>
+                {accountError && <div className="inline-error">{accountError}</div>}
+                <div className="account-actions">
+                  <button className="secondary" disabled={accountBusy} onClick={() => void signOutAccount()}>Sign out</button>
+                  <button className="primary" disabled={accountBusy} onClick={() => void syncAccountNow()}>{accountBusy ? "Working…" : "Sync now"}</button>
+                </div>
+                <small>Signing out does not erase the local copy on this device.</small>
+              </div>
+            ) : (
+              <form className="account-form" onSubmit={submitAccountLogin}>
+                <p>Use the same username and password on any computer.</p>
+                <label>
+                  <span>Username</span>
+                  <input
+                    autoFocus
+                    autoComplete="username"
+                    value={accountUsername}
+                    onChange={(event) => setAccountUsername(event.target.value)}
+                    placeholder="Your username"
+                    disabled={accountBusy}
+                  />
+                </label>
+                <label>
+                  <span>Password</span>
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    value={accountPassword}
+                    onChange={(event) => setAccountPassword(event.target.value)}
+                    placeholder="At least 6 characters"
+                    disabled={accountBusy}
+                  />
+                </label>
+                <small>Username: 3–30 letters, numbers, underscores or hyphens.</small>
+                {accountError && <div className="inline-error">{accountError}</div>}
+                <div className="account-actions">
+                  <button type="button" className="secondary" disabled={accountBusy} onClick={() => void authenticateAccount(true)}>Create account</button>
+                  <button type="submit" className="primary" disabled={accountBusy}>{accountBusy ? "Working…" : "Sign in"}</button>
+                </div>
+              </form>
+            )}
+          </section>
+        </div>
+      )}
+
       {settingsOpen && (
         <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setSettingsOpen(false); }}>
           <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -1921,7 +2261,9 @@ export default function BrickCheckApp() {
               <span>API key</span>
               <input type="password" value={apiDraft} onChange={(event) => setApiDraft(event.target.value)} placeholder="Paste your Rebrickable API key" />
             </label>
-            <p className="privacy-note">Your key stays in this browser and is only sent to Rebrickable when you search or load an inventory.</p>
+            <p className="privacy-note">{account
+              ? `Your key is synced privately to ${account.username} and sent only to Rebrickable when needed.`
+              : "Your key stays in this browser and is only sent to Rebrickable when you search or load an inventory."}</p>
             <div className="theme-setting">
               <div>
                 <strong>Appearance</strong>

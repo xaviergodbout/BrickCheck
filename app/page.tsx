@@ -3,6 +3,9 @@
 import {
   ChangeEvent,
   FormEvent,
+  memo,
+  useCallback,
+  useDeferredValue,
   useEffect,
   useId,
   useMemo,
@@ -10,6 +13,12 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { Icon } from "@/components/icon";
+import { Modal } from "@/components/modal";
+import { Counter } from "@/components/quantity-counter";
+import { createPartMatcher, resolveFound, type FoundUpdate } from "@/lib/part-search";
+import { rebrickableList } from "@/lib/rebrickable";
+import { previewPosition } from "@/lib/preview-position";
 import type { User } from "@supabase/supabase-js";
 import {
   getSupabaseClient,
@@ -18,127 +27,52 @@ import {
   usernameToEmail,
 } from "@/lib/supabase";
 
-type ViewMode = "grid" | "list";
-type FilterMode = "all" | "missing" | "found" | "minifigs";
-type PageMode = "check" | "sets";
-type MinifigMode = "assembled" | "parts";
-type ThemeMode = "light" | "dark";
-type SortMode = "part" | "quantity" | "size";
-type SortDirection = "asc" | "desc";
-type GroupMode = "none" | "color" | "status";
-type SearchKind = "all" | "sets" | "minifigs" | "polybag" | "brickheadz" | "mocs";
-type SearchSort = "relevance" | "date_desc" | "date_asc" | "pieces_desc" | "pieces_asc";
-
-type PartItem = {
-  id: string;
-  partNum: string;
-  bricklinkPartNum?: string;
-  colorId?: number;
-  bricklinkColorId?: number;
-  name: string;
-  colorName: string;
-  colorRgb: string;
-  imageUrl: string;
-  quantity: number;
-  found: number;
-  spare?: boolean;
-};
-
-type MiniFig = {
-  id: string;
-  figNum: string;
-  name: string;
-  imageUrl: string;
-  quantity: number;
-  found: number;
-  parts?: PartItem[];
-};
-
-type SavedSet = {
-  id: string;
-  setNum: string;
-  name: string;
-  year: number;
-  theme: string;
-  setImage: string;
-  setImages: string[];
-  setUrl?: string;
-  catalogParts: number;
-  parts: PartItem[];
-  minifigs: MiniFig[];
-  minifigMode: MinifigMode;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type SearchResult = {
-  set_num: string;
-  name: string;
-  year: number;
-  num_parts: number;
-  set_img_url: string;
-  set_url?: string;
-  theme_id?: number;
-  themeName?: string;
-  kind: "set" | "minifig";
-};
-
-type GalleryState = {
-  title: string;
-  images: string[];
-  index: number;
-  externalUrl?: string;
-};
-
-type BrickLinkXmlState = {
-  setNum: string;
-  xml: string;
-  lotCount: number;
-  pieceCount: number;
-};
-
-type MocReference = {
-  id: string;
-  pageUrl: string;
-  suggestedName: string;
-};
-
-type MocInventoryRow = {
-  partNum: string;
-  colorId: number;
-  quantity: number;
-  spare: boolean;
-};
-
-type MissingPart = {
-  part: PartItem;
-  quantity: number;
-};
-
-type BrickLinkColorMaps = {
-  byRebrickableId: Map<number, number>;
-  byName: Map<string, number>;
-  byRgb: Map<string, number>;
-};
-
-type BrickCheckAccount = {
-  userId: string;
-  username: string;
-};
-
-type AccountSyncStatus = "idle" | "loading" | "syncing" | "saved" | "error";
-
-type CloudAccountRow = {
-  user_id: string;
-  username: string;
-  sets: unknown;
-  api_key: string | null;
-  active_set_id: string | null;
-  updated_at: string;
-};
+import {
+  type ViewMode,
+  type FilterMode,
+  type PageMode,
+  type ThemeMode,
+  type SortMode,
+  type SortDirection,
+  type GroupMode,
+  type SearchKind,
+  type SearchSort,
+  type PartItem,
+  type SavedSet,
+  type SearchResult,
+  type GalleryState,
+  type BrickLinkXmlState,
+  type MissingPart,
+  type BrickLinkColorMaps,
+  type BrickCheckAccount,
+  type AccountSyncStatus,
+  type CloudAccountRow,
+  externalId,
+  normaliseColorKey,
+  inferRebrickableColorId,
+  rebrickableColorPartImage,
+  bricklinkColorPartImage,
+  escapeXml,
+  parseMocReference,
+  parseMocInventoryCsv,
+  defaultMocImage,
+  isBrickBuiltSet,
+  isPolybagResult,
+  isBrickHeadzResult,
+  rankSearchResult,
+  sortDirectionLabel,
+  type PartGroup,
+  groupParts,
+  getProgress,
+  relativeDate,
+  normaliseImportedSet,
+  normaliseSavedSets,
+  mergeSavedSets,
+} from "@/lib/brickcheck";
 
 const STORAGE_KEY = "brickcheck:sets:v1";
 const API_KEY_STORAGE = "brickcheck:rebrickable-key";
+const ACTIVE_STORAGE = "brickcheck:active-set";
 const VIEW_STORAGE = "brickcheck:view";
 const SETS_VIEW_STORAGE = "brickcheck:sets-view";
 const THEME_STORAGE = "brickcheck:theme";
@@ -147,269 +81,8 @@ const SORT_DIRECTION_STORAGE = "brickcheck:sort-direction";
 const GROUP_STORAGE = "brickcheck:group";
 const APP_BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 
-function clamp(value: number, min: number, max: number) {
-  return Math.min(Math.max(value, min), max);
-}
 
-function externalId(source: unknown, provider: string) {
-  if (!source || typeof source !== "object") return undefined;
-  const entry = Object.entries(source).find(([name]) => name.toLowerCase() === provider.toLowerCase())?.[1];
-  const entryRecord = entry && typeof entry === "object" && !Array.isArray(entry)
-    ? entry as Record<string, unknown>
-    : undefined;
-  const values = Array.isArray(entry)
-    ? entry
-    : Array.isArray(entryRecord?.ext_ids)
-      ? entryRecord.ext_ids
-      : entry == null
-        ? []
-        : [entry];
-  const value = values.find((candidate) => candidate != null && String(candidate).trim());
-  return value == null ? undefined : String(value);
-}
-
-function normaliseColorKey(value: string) {
-  return value.trim().replace(/^#/, "").toLowerCase();
-}
-
-function inferRebrickableColorId(part: PartItem) {
-  if (Number.isFinite(part.colorId)) return Number(part.colorId);
-  const marker = `:${part.partNum}:`;
-  const markerIndex = part.id.indexOf(marker);
-  if (markerIndex < 0) return undefined;
-  const inferred = Number(part.id.slice(markerIndex + marker.length).split(":")[0]);
-  return Number.isFinite(inferred) ? inferred : undefined;
-}
-
-function rebrickableColorPartImage(partNum: string, colorId: number) {
-  return `https://cdn.rebrickable.com/media/parts/ldraw/${colorId}/${encodeURIComponent(partNum)}.png`;
-}
-
-function bricklinkColorPartImage(part: PartItem) {
-  const partNum = part.bricklinkPartNum ?? part.partNum;
-  if (!partNum || !Number.isFinite(part.bricklinkColorId)) return "";
-  return `https://img.bricklink.com/ItemImage/PN/${part.bricklinkColorId}/${encodeURIComponent(partNum)}.png`;
-}
-
-function escapeXml(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
-
-function parseMocReference(value: string): MocReference | null {
-  const trimmed = value.trim();
-  const match = trimmed.match(/\bMOC-(\d+)\b/i);
-  if (!match) return null;
-  const id = `MOC-${match[1]}`;
-  let pageUrl = `https://rebrickable.com/mocs/${id}/`;
-  let suggestedName = `Custom ${id}`;
-
-  try {
-    const url = new URL(trimmed);
-    if (!/(^|\.)rebrickable\.com$/i.test(url.hostname) || !/\/mocs\//i.test(url.pathname)) return null;
-    pageUrl = `${url.origin}${url.pathname}`;
-    const segments = url.pathname.split("/").filter(Boolean);
-    const mocIndex = segments.findIndex((segment) => segment.toUpperCase() === id);
-    const slug = mocIndex >= 0 ? segments[mocIndex + 2] : undefined;
-    if (slug) {
-      const decoded = decodeURIComponent(slug).replace(/[-_]+/g, " ").trim();
-      suggestedName = decoded ? decoded[0].toUpperCase() + decoded.slice(1) : suggestedName;
-    }
-  } catch {
-    // Plain MOC IDs (including surrounding punctuation) are valid references.
-  }
-
-  return { id, pageUrl, suggestedName };
-}
-
-function parseCsvRows(source: string) {
-  const firstLine = source.split(/\r?\n/).find((line) => line.trim()) ?? "";
-  const delimiters = [",", ";", "\t"];
-  const delimiter = delimiters.sort((a, b) => firstLine.split(b).length - firstLine.split(a).length)[0];
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let quoted = false;
-
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index];
-    if (character === '"') {
-      if (quoted && source[index + 1] === '"') {
-        cell += '"';
-        index += 1;
-      } else {
-        quoted = !quoted;
-      }
-    } else if (character === delimiter && !quoted) {
-      row.push(cell.trim());
-      cell = "";
-    } else if ((character === "\n" || character === "\r") && !quoted) {
-      if (character === "\r" && source[index + 1] === "\n") index += 1;
-      row.push(cell.trim());
-      if (row.some(Boolean)) rows.push(row);
-      row = [];
-      cell = "";
-    } else {
-      cell += character;
-    }
-  }
-  row.push(cell.trim());
-  if (row.some(Boolean)) rows.push(row);
-  return rows;
-}
-
-function parseMocInventoryCsv(source: string): MocInventoryRow[] {
-  const rows = parseCsvRows(source.replace(/^\uFEFF/, ""));
-  if (rows.length < 2) throw new Error("That CSV does not contain a parts inventory.");
-  const headers = rows[0].map((header) => header.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim());
-  const findColumn = (...aliases: string[]) => headers.findIndex((header) => aliases.includes(header));
-  const partIndex = findColumn("part", "part num", "part number", "part id", "partnum");
-  const colorIndex = findColumn("color", "colour", "color id", "colour id", "colorid");
-  const quantityIndex = findColumn("quantity", "qty", "count");
-  const spareIndex = findColumn("is spare", "spare", "is extra", "extra");
-  if (partIndex < 0 || colorIndex < 0 || quantityIndex < 0) {
-    throw new Error("Use Rebrickable CSV format with Part, Color and Quantity columns.");
-  }
-
-  const grouped = new Map<string, MocInventoryRow>();
-  rows.slice(1).forEach((values) => {
-    const partNum = values[partIndex]?.trim();
-    const colorId = Number(values[colorIndex]);
-    const quantity = Number(values[quantityIndex]);
-    if (!partNum || !Number.isFinite(colorId) || !Number.isFinite(quantity) || quantity <= 0) return;
-    const spareValue = spareIndex >= 0 ? values[spareIndex]?.trim().toLowerCase() : "";
-    const spare = ["true", "yes", "y", "1"].includes(spareValue);
-    const key = `${partNum}:${colorId}:${spare ? 1 : 0}`;
-    const existing = grouped.get(key);
-    grouped.set(key, { partNum, colorId, quantity: (existing?.quantity ?? 0) + Math.floor(quantity), spare });
-  });
-  const inventory = Array.from(grouped.values());
-  if (!inventory.length) throw new Error("No valid parts were found in that CSV.");
-  return inventory;
-}
-
-function defaultMocImage(mocId: string) {
-  const number = mocId.replace(/^MOC-/i, "");
-  return `https://cdn.rebrickable.com/media/thumbs/mocs/moc-${number}.jpg/1000x800p.jpg`;
-}
-
-function isBrickBuiltSet(result: SearchResult) {
-  const baseNumber = result.set_num.split("-")[0];
-  const nonSetMedia = /\b(activity book|book|magazine|costume|plush|video|dvd|key ?chain|push clip)\b/i;
-  return (
-    /^\d{2,7}$/.test(baseNumber) &&
-    Number(result.num_parts) > 0 &&
-    !nonSetMedia.test(result.name)
-  );
-}
-
-function isPolybagResult(result: SearchResult) {
-  return /\b(polybag|foil pack|promotional|gift with purchase)\b/i.test(`${result.name} ${result.themeName ?? ""}`);
-}
-
-function isBrickHeadzResult(result: SearchResult) {
-  return /brick\s*headz/i.test(`${result.name} ${result.themeName ?? ""}`);
-}
-
-function rankSearchResult(result: SearchResult, query: string) {
-  const name = result.name.toLowerCase();
-  const normalizedQuery = query.trim().toLowerCase();
-  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
-  let score = 0;
-  if (result.set_num.toLowerCase() === normalizedQuery) score += 2000;
-  if (name === normalizedQuery) score += 1200;
-  if (name.startsWith(normalizedQuery)) score += 700;
-  if (name.includes(normalizedQuery)) score += 450;
-  score += tokens.filter((token) => name.includes(token)).length * 120;
-  score += Math.min(result.year || 0, 2100) / 100;
-  return score;
-}
-
-function pieceSizeScore(part: PartItem) {
-  const dimensions = Array.from(part.name.matchAll(/\b(\d+(?:\s+\d+\/\d+)?)(?=\s*x|\s|$)/gi))
-    .slice(0, 3)
-    .map((match) => {
-      const [whole, fraction] = match[1].split(/\s+/);
-      if (!fraction) return Number(whole) || 1;
-      const [numerator, denominator] = fraction.split("/").map(Number);
-      return (Number(whole) || 0) + (denominator ? numerator / denominator : 0);
-    });
-  return dimensions.length ? dimensions.reduce((product, value) => product * value, 1) : 0;
-}
-
-function sortParts(parts: PartItem[], sort: SortMode, direction: SortDirection) {
-  return [...parts].sort((a, b) => {
-    const comparison = sort === "quantity"
-      ? a.quantity - b.quantity
-      : sort === "size"
-        ? pieceSizeScore(a) - pieceSizeScore(b)
-        : a.partNum.localeCompare(b.partNum, undefined, { numeric: true });
-    if (comparison) return direction === "asc" ? comparison : -comparison;
-    return a.partNum.localeCompare(b.partNum, undefined, { numeric: true });
-  });
-}
-
-function sortDirectionLabel(sort: SortMode, direction: SortDirection) {
-  if (sort === "quantity") return direction === "desc" ? "High first" : "Low first";
-  if (sort === "size") return direction === "desc" ? "Large first" : "Small first";
-  return direction === "asc" ? "Ascending" : "Descending";
-}
-
-type PartGroup = { label: string; note?: string; parts: PartItem[] };
-
-function groupParts(parts: PartItem[], group: GroupMode, sort: SortMode, direction: SortDirection): PartGroup[] {
-  const sorted = sortParts(parts, sort, direction);
-  if (!sorted.length) return [];
-  if (group === "none") return [{ label: "", parts: sorted }];
-  const buckets = new Map<string, PartItem[]>();
-  sorted.forEach((part) => {
-    const label = group === "color"
-      ? part.colorName
-      : (part.found >= part.quantity ? "Completed" : "Missing");
-    buckets.set(label, [...(buckets.get(label) ?? []), part]);
-  });
-  return Array.from(buckets, ([label, grouped]) => ({ label, parts: grouped }))
-    .sort((a, b) => {
-      if (group === "status") return a.label === "Missing" ? -1 : 1;
-      return a.label.localeCompare(b.label);
-    });
-}
-
-function getProgress(set: SavedSet) {
-  const requiredParts = set.parts.filter((part) => !part.spare);
-  const partRequired = requiredParts.reduce((sum, part) => sum + part.quantity, 0);
-  const partFound = requiredParts.reduce((sum, part) => sum + part.found, 0);
-  const figItems =
-    set.minifigMode === "parts"
-      ? set.minifigs.flatMap((fig) => fig.parts ?? [])
-      : set.minifigs;
-  const figRequired = figItems.reduce((sum, item) => sum + item.quantity, 0);
-  const figFound = figItems.reduce((sum, item) => sum + item.found, 0);
-  const required = partRequired + figRequired;
-  const found = partFound + figFound;
-  return {
-    required,
-    found,
-    percent: required ? Math.round((found / required) * 100) : 0,
-  };
-}
-
-function relativeDate(dateString: string) {
-  const elapsed = Date.now() - new Date(dateString).getTime();
-  if (elapsed < 60_000) return "just now";
-  const minutes = Math.floor(elapsed / 60_000);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return days === 1 ? "yesterday" : `${days}d ago`;
-}
-
-function PartVisual({
+const PartVisual = memo(function PartVisual({
   src,
   fallbackSrc,
   name,
@@ -424,7 +97,8 @@ function PartVisual({
 }) {
   const anchorName = `--part-preview-${useId().replace(/[^a-z0-9]/gi, "")}`;
   const [failedSources, setFailedSources] = useState<string[]>([]);
-  const [previewing, setPreviewing] = useState(false);
+  const [preview, setPreview] = useState<ReturnType<typeof previewPosition> | null>(null);
+  const imageRef = useRef<HTMLSpanElement>(null);
   const previewTimer = useRef<number | null>(null);
   const sources = [src, fallbackSrc].filter((source, index, list): source is string => (
     Boolean(source) && list.indexOf(source) === index
@@ -432,30 +106,41 @@ function PartVisual({
   const activeSrc = sources.find((source) => !failedSources.includes(source)) ?? "";
 
   const beginPreview = () => {
-    if (!activeSrc) return;
+    if (!activeSrc || !window.matchMedia("(hover: hover) and (pointer: fine)").matches) return;
     if (previewTimer.current) window.clearTimeout(previewTimer.current);
-    previewTimer.current = window.setTimeout(() => setPreviewing(true), 1000);
+    previewTimer.current = window.setTimeout(() => {
+      const bounds = imageRef.current?.getBoundingClientRect();
+      if (bounds) setPreview(previewPosition(bounds, document.documentElement.clientWidth, window.innerHeight));
+    }, 1000);
   };
 
   const endPreview = () => {
     if (previewTimer.current) window.clearTimeout(previewTimer.current);
     previewTimer.current = null;
-    setPreviewing(false);
+    setPreview(null);
   };
 
   useEffect(() => () => {
     if (previewTimer.current) window.clearTimeout(previewTimer.current);
   }, []);
 
+  useEffect(() => {
+    if (!preview) return;
+    const close = () => setPreview(null);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => { window.removeEventListener("scroll", close, true); window.removeEventListener("resize", close); };
+  }, [preview]);
+
   if (!activeSrc) {
     return (
       <span className={`zoomable-image ${className}`}>
         <span
           className="image-fallback"
-          style={{ background: color ? `#${color}` : undefined }}
+          title={`${name} image unavailable${color ? ` · #${color}` : ""}`}
           aria-label={`${name} image unavailable`}
         >
-          <span>{name.slice(0, 2).toUpperCase()}</span>
+          <Icon name="image" /><small>Image unavailable</small>
         </span>
       </span>
     );
@@ -464,6 +149,7 @@ function PartVisual({
     <>
       <span
         className={`zoomable-image ${className}`}
+        ref={imageRef}
         style={{ anchorName } as React.CSSProperties}
         onMouseEnter={beginPreview}
         onMouseLeave={endPreview}
@@ -472,52 +158,25 @@ function PartVisual({
           src={activeSrc}
           alt={name}
           loading="lazy"
+          decoding="async"
           onError={() => {
-            setPreviewing(false);
+            setPreview(null);
             setFailedSources((current) => current.includes(activeSrc) ? current : [...current, activeSrc]);
           }}
         />
       </span>
-      {previewing && createPortal(
-        <span className="image-preview" role="presentation" style={{ positionAnchor: anchorName } as React.CSSProperties}>
+      {preview && createPortal(
+        <span className="image-preview" data-side={preview.side} role="presentation" style={{
+          positionAnchor: anchorName, "--preview-left": `${preview.left}px`, "--preview-top": `${preview.top}px`, "--preview-size": `${preview.size}px`,
+        } as React.CSSProperties}>
           <img src={activeSrc} alt="" />
         </span>,
         document.body,
       )}
     </>
   );
-}
+});
 
-async function rebrickableFetch(path: string, key: string) {
-  const url = path.startsWith("http")
-    ? path
-    : `https://rebrickable.com/api/v3${path}`;
-  const response = await fetch(url, {
-    headers: { Authorization: `key ${key.trim()}` },
-  });
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("That API key was not accepted. Check it and try again.");
-    }
-    if (response.status === 404) throw new Error("That set could not be found.");
-    throw new Error("Rebrickable is unavailable right now. Please try again.");
-  }
-  return response.json();
-}
-
-async function rebrickableList(path: string, key: string, maxResults = Number.POSITIVE_INFINITY) {
-  const results: unknown[] = [];
-  let next: string | null = path;
-  while (next && results.length < maxResults) {
-    const page = (await rebrickableFetch(next, key)) as {
-      results?: unknown[];
-      next?: string | null;
-    };
-    results.push(...(page.results ?? []));
-    next = page.next ?? null;
-  }
-  return results.slice(0, maxResults);
-}
 
 function mapApiPart(raw: any, prefix = "part"): PartItem {
   const colorId = raw.color?.id ?? "0";
@@ -541,69 +200,6 @@ function mapApiPart(raw: any, prefix = "part"): PartItem {
   };
 }
 
-function normaliseImportedSet(value: any): SavedSet | null {
-  if (!value || typeof value !== "object" || !value.setNum || !value.name) return null;
-  const isMoc = /^MOC-\d+$/i.test(String(value.setNum));
-  const parts = Array.isArray(value.parts)
-    ? value.parts.map((part: PartItem) => {
-        const colorId = inferRebrickableColorId(part);
-        return {
-          ...part,
-          imageUrl: isMoc && colorId != null
-            ? rebrickableColorPartImage(part.partNum, colorId)
-            : part.imageUrl,
-          quantity: Math.max(Number(part.quantity) || 1, 1),
-          found: clamp(Number(part.found) || 0, 0, Math.max(Number(part.quantity) || 1, 1)),
-        };
-      })
-    : [];
-  const minifigs = Array.isArray(value.minifigs)
-    ? value.minifigs.map((fig: MiniFig) => ({
-        ...fig,
-        quantity: Math.max(Number(fig.quantity) || 1, 1),
-        found: clamp(Number(fig.found) || 0, 0, Math.max(Number(fig.quantity) || 1, 1)),
-        parts: Array.isArray(fig.parts)
-          ? fig.parts.map((part) => ({
-              ...part,
-              quantity: Math.max(Number(part.quantity) || 1, 1),
-              found: clamp(Number(part.found) || 0, 0, Math.max(Number(part.quantity) || 1, 1)),
-            }))
-          : undefined,
-      }))
-    : [];
-  return {
-    ...value,
-    id: String(value.id || `${value.setNum}-${Date.now()}`),
-    setImages: Array.from(new Set(
-      (Array.isArray(value.setImages) ? value.setImages : [value.setImage]).filter(Boolean),
-    )),
-    parts,
-    minifigs,
-    minifigMode: value.minifigMode === "parts" ? "parts" : "assembled",
-    createdAt: value.createdAt || new Date().toISOString(),
-    updatedAt: value.updatedAt || new Date().toISOString(),
-  } as SavedSet;
-}
-
-function normaliseSavedSets(values: unknown): SavedSet[] {
-  return Array.isArray(values)
-    ? values
-        .map(normaliseImportedSet)
-        .filter((set): set is SavedSet => set !== null && !set.id.startsWith("demo-"))
-    : [];
-}
-
-function mergeSavedSets(localSets: SavedSet[], cloudSets: SavedSet[]) {
-  const merged = new Map<string, SavedSet>();
-  [...localSets, ...cloudSets].forEach((set) => {
-    const key = set.setNum.trim().toUpperCase();
-    const current = merged.get(key);
-    if (!current || new Date(set.updatedAt).getTime() > new Date(current.updatedAt).getTime()) {
-      merged.set(key, set);
-    }
-  });
-  return Array.from(merged.values());
-}
 
 function validateUsername(value: string) {
   const username = normaliseUsername(value);
@@ -614,7 +210,9 @@ function validateUsername(value: string) {
 }
 
 function friendlyAccountError(error: unknown, creating = false) {
-  const message = error instanceof Error ? error.message : String(error ?? "");
+  const message = error && typeof error === "object" && "message" in error ? String(error.message) : String(error ?? "");
+  if (/email.*rate limit/i.test(message)) return "Supabase is trying to send a confirmation email. Disable Confirm email in Supabase → Authentication → Providers → Email, then wait for the rate limit to reset before creating the account again.";
+  if (/rate limit|too many requests/i.test(message)) return "Too many sign-in attempts. Please wait a little before trying again.";
   if (/invalid login credentials/i.test(message)) return "That username or password is incorrect.";
   if (/already registered|already exists|duplicate/i.test(message)) return "That username is already taken.";
   if (/password should be at least/i.test(message)) return "Use a password with at least 6 characters.";
@@ -635,6 +233,8 @@ export default function BrickCheckApp() {
   const [group, setGroup] = useState<GroupMode>("none");
   const [theme, setTheme] = useState<ThemeMode>("light");
   const [partQuery, setPartQuery] = useState("");
+  const deferredPartQuery = useDeferredValue(partQuery);
+  const partMatcher = useMemo(() => createPartMatcher(deferredPartQuery), [deferredPartQuery]);
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -669,10 +269,17 @@ export default function BrickCheckApp() {
   const [mocImporting, setMocImporting] = useState(false);
   const [mocError, setMocError] = useState("");
   const [hydrated, setHydrated] = useState(false);
+  const [storageWarning, setStorageWarning] = useState("");
+  const storageWritableRef = useRef(true);
+  const persistRef = useRef(() => {});
+  const cloudSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  const cloudRevision = useRef(0);
+  const [searchLimit, setSearchLimit] = useState(48);
   const importRef = useRef<HTMLInputElement>(null);
   const mocInventoryRef = useRef<HTMLInputElement>(null);
   const bricklinkXmlRef = useRef<HTMLTextAreaElement>(null);
   const searchRequestRef = useRef(0);
+  const searchAbortRef = useRef<AbortController | null>(null);
   const themeMapRef = useRef<Map<number, string>>(new Map());
   const accountConfigured = isAccountSyncConfigured();
 
@@ -684,6 +291,7 @@ export default function BrickCheckApp() {
   ) => {
     const client = getSupabaseClient();
     if (!client) throw new Error("Account sync has not been configured for this deployment.");
+    const save = async () => {
     const { error: syncError } = await client
       .from("brickcheck_accounts")
       .upsert({
@@ -695,6 +303,11 @@ export default function BrickCheckApp() {
         updated_at: new Date().toISOString(),
       }, { onConflict: "user_id" });
     if (syncError) throw syncError;
+    };
+    // Serialize writes so a slower old snapshot cannot overwrite a newer one.
+    const pending = cloudSaveQueue.current.catch(() => {}).then(save);
+    cloudSaveQueue.current = pending;
+    await pending;
   };
 
   const loadCloudAccount = async (user: User, requestedUsername?: string) => {
@@ -745,7 +358,8 @@ export default function BrickCheckApp() {
       const storedSets = rawSets ? (JSON.parse(rawSets) as SavedSet[]) : [];
       const safeSets = normaliseSavedSets(storedSets);
       setSets(safeSets);
-      setActiveId(safeSets[0]?.id ?? "");
+      const storedActiveId = localStorage.getItem(ACTIVE_STORAGE);
+      setActiveId(safeSets.find((set) => set.id === storedActiveId)?.id ?? safeSets[0]?.id ?? "");
       if (!safeSets.length) setPage("sets");
       const storedKey = localStorage.getItem(API_KEY_STORAGE) ?? "";
       setApiKey(storedKey);
@@ -768,6 +382,8 @@ export default function BrickCheckApp() {
       setTheme(preferredTheme);
       document.documentElement.dataset.theme = preferredTheme;
     } catch {
+      storageWritableRef.current = false;
+      setStorageWarning("Saved data could not be read. Your existing browser copy has been left untouched. Export any new checks before closing this page.");
       setSets([]);
       setActiveId("");
       setPage("sets");
@@ -806,16 +422,38 @@ export default function BrickCheckApp() {
 
   useEffect(() => {
     if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(sets));
-  }, [sets, hydrated]);
+    const persist = () => {
+      if (!storageWritableRef.current) return;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(sets));
+        localStorage.setItem(ACTIVE_STORAGE, activeId);
+        localStorage.setItem(API_KEY_STORAGE, apiKey);
+        setStorageWarning("");
+      } catch {
+        setStorageWarning("This browser could not save your latest changes. Export all sets as a backup before closing this page.");
+      }
+    };
+    persistRef.current = persist;
+    const timer = window.setTimeout(persist, 180);
+    return () => window.clearTimeout(timer);
+  }, [sets, activeId, apiKey, hydrated]);
+
+  useEffect(() => {
+    const save = () => persistRef.current();
+    const visibility = () => { if (document.visibilityState === "hidden") save(); };
+    window.addEventListener("pagehide", save);
+    document.addEventListener("visibilitychange", visibility);
+    return () => { save(); window.removeEventListener("pagehide", save); document.removeEventListener("visibilitychange", visibility); };
+  }, []);
 
   useEffect(() => {
     if (!hydrated || !account || !accountSyncReady) return;
+    const revision = ++cloudRevision.current;
     const timer = window.setTimeout(() => {
       setAccountSyncStatus("syncing");
       void saveCloudSnapshot(account)
-        .then(() => setAccountSyncStatus("saved"))
-        .catch(() => setAccountSyncStatus("error"));
+        .then(() => { if (revision === cloudRevision.current) setAccountSyncStatus("saved"); })
+        .catch(() => { if (revision === cloudRevision.current) setAccountSyncStatus("error"); });
     }, 900);
     return () => window.clearTimeout(timer);
     // saveCloudSnapshot intentionally captures the current snapshot values.
@@ -863,44 +501,34 @@ export default function BrickCheckApp() {
     });
   }, [searchResults, searchKind, searchSort, searchQuery]);
 
-  const updateActive = (updater: (set: SavedSet) => SavedSet) => {
+  const activeSetId = activeSet?.id;
+  const updateActive = useCallback((updater: (set: SavedSet) => SavedSet) => {
     setSets((current) =>
       current.map((set) =>
-        set.id === activeSet?.id
+        set.id === activeSetId
           ? { ...updater(set), updatedAt: new Date().toISOString() }
           : set,
       ),
     );
-  };
+  }, [activeSetId]);
 
   const visibleParts = useMemo(() => {
     if (!activeSet) return [];
     if (filter === "minifigs") return [];
-    const query = partQuery.trim().toLowerCase();
     return activeSet.parts.filter((part) => {
-      const matchesQuery =
-        !query ||
-        part.name.toLowerCase().includes(query) ||
-        part.partNum.toLowerCase().includes(query) ||
-        part.colorName.toLowerCase().includes(query);
+      const matchesQuery = partMatcher(part);
       const complete = part.found >= part.quantity;
       const matchesFilter = filter === "all" || (filter === "found" ? complete : !complete);
       return matchesQuery && matchesFilter;
     });
-  }, [activeSet, partQuery, filter]);
+  }, [activeSet, partMatcher, filter]);
 
   const visibleMinifigs = useMemo(() => {
     if (!activeSet) return [];
-    const query = partQuery.trim().toLowerCase();
     return activeSet.minifigs.filter((fig) => {
       const figParts = fig.parts ?? [];
       const matchesQuery =
-        !query ||
-        fig.name.toLowerCase().includes(query) ||
-        fig.figNum.toLowerCase().includes(query) ||
-        figParts.some((part) =>
-          `${part.name} ${part.partNum} ${part.colorName}`.toLowerCase().includes(query),
-        );
+        partMatcher({ name: fig.name, partNum: fig.figNum, colorName: "" }) || figParts.some(partMatcher);
       const complete = activeSet.minifigMode === "assembled"
         ? fig.found >= fig.quantity
         : figParts.length > 0 && figParts.every((part) => part.found >= part.quantity);
@@ -910,7 +538,7 @@ export default function BrickCheckApp() {
         (filter === "found" ? complete : !complete);
       return matchesQuery && matchesFilter;
     });
-  }, [activeSet, partQuery, filter]);
+  }, [activeSet, partMatcher, filter]);
 
   const standardParts = useMemo(
     () => visibleParts.filter((part) => !part.spare),
@@ -938,7 +566,7 @@ export default function BrickCheckApp() {
       ).length
     : 0;
 
-  const setPartFound = (partId: string, value: number, figId?: string) => {
+  const setPartFound = useCallback((partId: string, value: FoundUpdate, figId?: string) => {
     updateActive((set) => {
       if (figId) {
         return {
@@ -949,7 +577,7 @@ export default function BrickCheckApp() {
                   ...fig,
                   parts: fig.parts?.map((part) =>
                     part.id === partId
-                      ? { ...part, found: clamp(value, 0, part.quantity) }
+                      ? { ...part, found: resolveFound(part.found, part.quantity, value) }
                       : part,
                   ),
                 }
@@ -961,19 +589,19 @@ export default function BrickCheckApp() {
         ...set,
         parts: set.parts.map((part) =>
           part.id === partId
-            ? { ...part, found: clamp(value, 0, part.quantity) }
+            ? { ...part, found: resolveFound(part.found, part.quantity, value) }
             : part,
         ),
       };
     });
-  };
+  }, [updateActive]);
 
-  const setFigFound = (figId: string, value: number) => {
+  const setFigFound = (figId: string, value: FoundUpdate) => {
     updateActive((set) => ({
       ...set,
       minifigs: set.minifigs.map((fig) =>
         fig.id === figId
-          ? { ...fig, found: clamp(value, 0, fig.quantity) }
+          ? { ...fig, found: resolveFound(fig.found, fig.quantity, value) }
           : fig,
       ),
     }));
@@ -1218,6 +846,10 @@ export default function BrickCheckApp() {
   };
 
   const performSearch = async (queryValue: string, manual = false) => {
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+    const requestId = ++searchRequestRef.current;
     const query = queryValue.trim();
     if ((!manual && query.length < 2) || !query) return;
     if (parseMocReference(query) || searchKind === "mocs") {
@@ -1234,7 +866,6 @@ export default function BrickCheckApp() {
       return;
     }
 
-    const requestId = ++searchRequestRef.current;
     setError("");
     setSearching(true);
     try {
@@ -1248,16 +879,16 @@ export default function BrickCheckApp() {
       const needsMinifigs = searchKind === "all" || searchKind === "minifigs";
 
       const themesPromise = needsSets && !themeMapRef.current.size
-        ? rebrickableList("/lego/themes/?page_size=1000", apiKey, 2000).catch(() => [])
+        ? rebrickableList("/lego/themes/?page_size=1000", apiKey, 2000, controller.signal).catch(() => [])
         : Promise.resolve([]);
       const setsPromise = needsSets
         ? Promise.all(searchTerms.map((term) =>
-            rebrickableList(`/lego/sets/?search=${encodeURIComponent(term)}&page_size=500`, apiKey, 600),
+            rebrickableList(`/lego/sets/?search=${encodeURIComponent(term)}&page_size=500`, apiKey, 1000, controller.signal),
           ))
         : Promise.resolve([]);
       const minifigsPromise = needsMinifigs
         ? Promise.all(searchTerms.map((term) =>
-            rebrickableList(`/lego/minifigs/?search=${encodeURIComponent(term)}&page_size=500`, apiKey, 400),
+            rebrickableList(`/lego/minifigs/?search=${encodeURIComponent(term)}&page_size=500`, apiKey, 500, controller.signal),
           ))
         : Promise.resolve([]);
 
@@ -1303,7 +934,7 @@ export default function BrickCheckApp() {
         if (result.set_num && Number(result.num_parts) > 0) merged.set(`minifig:${result.set_num}`, result);
       });
 
-      const results = Array.from(merged.values()).slice(0, 300);
+      const results = Array.from(merged.values());
       const matchesCurrentFilter = results.filter((result) => {
         if (searchKind === "minifigs") return result.kind === "minifig";
         if (searchKind === "sets") return result.kind === "set";
@@ -1314,7 +945,7 @@ export default function BrickCheckApp() {
       setSearchResults(results);
       if (!matchesCurrentFilter.length) setError("No matching catalog items found.");
     } catch (searchError) {
-      if (requestId === searchRequestRef.current) {
+      if (!controller.signal.aborted && requestId === searchRequestRef.current) {
         setError(searchError instanceof Error ? searchError.message : "Search failed.");
       }
     } finally {
@@ -1332,6 +963,9 @@ export default function BrickCheckApp() {
   };
 
   useEffect(() => {
+    searchRequestRef.current += 1;
+    searchAbortRef.current?.abort();
+    setSearchLimit(48);
     if (!searchOpen) return;
     const query = searchQuery.trim();
     if (parseMocReference(query) || searchKind === "mocs") {
@@ -1349,7 +983,7 @@ export default function BrickCheckApp() {
       return;
     }
     const timer = window.setTimeout(() => void performSearch(query), 400);
-    return () => window.clearTimeout(timer);
+    return () => { window.clearTimeout(timer); searchAbortRef.current?.abort(); searchRequestRef.current += 1; };
   }, [searchQuery, searchOpen, searchKind, apiKey]);
 
   const addSearchResult = async (result: SearchResult) => {
@@ -1437,7 +1071,11 @@ export default function BrickCheckApp() {
           );
           return {
             ...fig,
-            parts: rawParts.map((part) => mapApiPart(part, fig.figNum)),
+            partsQuantity: fig.quantity,
+            parts: rawParts.map((part) => {
+              const mapped = mapApiPart(part, fig.figNum);
+              return { ...mapped, quantity: mapped.quantity * fig.quantity };
+            }),
           };
         }),
       );
@@ -1456,7 +1094,7 @@ export default function BrickCheckApp() {
     anchor.href = url;
     anchor.download = filename;
     anchor.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const downloadJson = (filename: string, payload: unknown) => {
@@ -1519,7 +1157,7 @@ export default function BrickCheckApp() {
           }
           figureParts
             .filter((part) => !part.spare)
-            .forEach((part) => missingParts.push({ part, quantity: part.quantity * missingFigures }));
+            .forEach((part) => missingParts.push({ part, quantity: Math.round(part.quantity * missingFigures / (fig.parts?.length ? (fig.partsQuantity ?? 1) : 1)) }));
         }
       }
 
@@ -1683,6 +1321,7 @@ export default function BrickCheckApp() {
   };
 
   const deleteSet = (set: SavedSet) => {
+    if (!window.confirm(`Remove ${set.name} and its progress from My Sets? Export it first if you want a backup.`)) return;
     const remaining = sets.filter((candidate) => candidate.id !== set.id);
     setSets(remaining);
     if (activeId === set.id) setActiveId(remaining[0]?.id ?? "");
@@ -1713,19 +1352,20 @@ export default function BrickCheckApp() {
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">Skip to content</a>
       <header className="topbar">
         <button className="brand" onClick={() => { setPage("sets"); setMobileMenuOpen(false); }}>
           <img className="brand-symbol" src={`${APP_BASE_PATH}/brickcheck-icon.webp`} alt="" />
           <span>Brick<span>Check</span></span>
         </button>
         <nav aria-label="Main navigation">
-          <button className={page === "check" ? "active" : ""} onClick={() => setPage("check")}>Workbench</button>
-          <button className={page === "sets" ? "active" : ""} onClick={() => setPage("sets")}>
+          <button className={page === "check" ? "active" : ""} aria-current={page === "check" ? "page" : undefined} onClick={() => setPage("check")}>Workbench</button>
+          <button className={page === "sets" ? "active" : ""} aria-current={page === "sets" ? "page" : undefined} onClick={() => setPage("sets")}>
             My Sets <span className="nav-count">{sets.length}</span>
           </button>
         </nav>
         <button className="catalog-search" onClick={() => setSearchOpen(true)}>
-          <span aria-hidden="true">⌕</span>
+          <Icon name="search" />
           <span>Find a set by name or number</span>
         </button>
         <div className="top-actions">
@@ -1735,17 +1375,17 @@ export default function BrickCheckApp() {
             title={account ? `Signed in as ${account.username}` : "Account sync"}
             onClick={openAccount}
           >
-            <span>{!accountReady && accountConfigured ? "…" : account ? account.username.slice(0, 1).toUpperCase() : "@"}</span>
+            {!accountReady && accountConfigured ? "…" : account ? account.username.slice(0, 1).toUpperCase() : <Icon name="user" />}
           </button>
-          <button className="icon-button" aria-label="Rebrickable settings" onClick={() => { setApiDraft(apiKey); setSettingsOpen(true); }}>⚙</button>
-          <button className="primary small new-check-button" aria-label="Start a new check" onClick={() => setSearchOpen(true)}><span aria-hidden="true">＋</span><span className="new-check-label">New check</span></button>
+          <button className="icon-button" aria-label="Rebrickable settings" onClick={() => { setApiDraft(apiKey); setSettingsOpen(true); }}><Icon name="settings" /></button>
+          <button className="primary small new-check-button" aria-label="Start a new check" onClick={() => setSearchOpen(true)}><Icon name="plus" /><span className="new-check-label">New check</span></button>
           <button
             className="icon-button mobile-menu-button"
             aria-label="Open navigation menu"
             aria-expanded={mobileMenuOpen}
             onClick={() => setMobileMenuOpen((open) => !open)}
           >
-            {mobileMenuOpen ? "×" : "☰"}
+            <Icon name={mobileMenuOpen ? "close" : "menu"} />
           </button>
         </div>
         {mobileMenuOpen && (
@@ -1758,32 +1398,38 @@ export default function BrickCheckApp() {
         )}
       </header>
 
+      {storageWarning && <div className="storage-warning" role="alert">{storageWarning} <button className="secondary compact" onClick={exportAll}>Export all</button></div>}
+      {error && !searchOpen && !settingsOpen && !mocOpen && <div className="inline-error" role="alert">{error}</div>}
       <input ref={importRef} className="hidden-input" type="file" accept="application/json,.json" onChange={importSets} />
 
       {page === "sets" ? (
-        <main className="sets-page">
+        <main className="sets-page" id="main-content">
           <section className="page-heading">
             <div>
               <p className="eyebrow">YOUR COLLECTION</p>
               <h1>My Sets</h1>
-              <p>{account ? `Synced to ${account.username} and saved on this device.` : "Every active parts check, saved automatically on this device."}</p>
+              <p>{account ? `Your collection, connected to ${account.username}.` : "Pick up where you left off."}</p>
             </div>
             <div className="heading-actions">
               <div className="view-switch sets-view-switch" role="group" aria-label="My Sets view style">
-                <button className={setsView === "grid" ? "active" : ""} aria-label="Grid view" onClick={() => { setSetsView("grid"); localStorage.setItem(SETS_VIEW_STORAGE, "grid"); }}>▦</button>
-                <button className={setsView === "list" ? "active" : ""} aria-label="List view" onClick={() => { setSetsView("list"); localStorage.setItem(SETS_VIEW_STORAGE, "list"); }}>☷</button>
+                <button className={setsView === "grid" ? "active" : ""} aria-pressed={setsView === "grid"} aria-label="Grid view" onClick={() => { setSetsView("grid"); localStorage.setItem(SETS_VIEW_STORAGE, "grid"); }}><Icon name="grid" /></button>
+                <button className={setsView === "list" ? "active" : ""} aria-pressed={setsView === "list"} aria-label="List view" onClick={() => { setSetsView("list"); localStorage.setItem(SETS_VIEW_STORAGE, "list"); }}><Icon name="list" /></button>
               </div>
-              <button className="secondary" onClick={() => importRef.current?.click()}>↥ Import</button>
-              <button className="primary" onClick={exportAll}>↓ Export all</button>
+              <button className="secondary" onClick={() => importRef.current?.click()}><Icon name="upload" />Import</button>
+              <button className="secondary" disabled={!sets.length} onClick={exportAll}><Icon name="download" />Export all</button>
             </div>
           </section>
 
-          <section className={`sets-grid ${setsView}`} aria-label="Saved sets">
-            <button className="new-set-card" onClick={() => setSearchOpen(true)}>
-              <span className="new-plus">＋</span>
-              <strong>Start a new BrickCheck</strong>
-              <small>Search the LEGO catalog</small>
-            </button>
+          <div className="collection-summary">
+            <span><strong>{sets.length}</strong>{sets.length === 1 ? "set" : "sets"}</span>
+            <span><strong>{sets.filter((set) => getProgress(set).percent < 100).length}</strong>in progress</span>
+            <span><strong>{sets.filter((set) => getProgress(set).percent === 100).length}</strong>complete</span>
+            <span className={`save-status ${accountSyncStatus === "error" ? "error" : ""}`}>
+              <Icon name={accountSyncStatus === "error" ? "user" : "check"} width="14" height="14" />
+              {account ? (accountSyncStatus === "syncing" || accountSyncStatus === "loading" ? "Syncing account…" : accountSyncStatus === "error" ? "Cloud sync needs attention" : "Account connected") : "Saved on this device"}
+            </span>
+          </div>
+          <section className={`sets-grid ${setsView} ${sets.length ? "" : "is-empty"}`} aria-label="Saved sets">
             {sets.map((set) => {
               const cardProgress = getProgress(set);
               return (
@@ -1808,17 +1454,22 @@ export default function BrickCheckApp() {
                   <div className="set-card-footer">
                     <span>Updated {relativeDate(set.updatedAt)}</span>
                     <div>
-                      <button aria-label={`Export ${set.name}`} onClick={() => exportSet(set)}>↓</button>
-                      <button aria-label={`Delete ${set.name}`} onClick={() => deleteSet(set)}>×</button>
+                      <button aria-label={`Export ${set.name}`} onClick={() => exportSet(set)}><Icon name="download" /></button>
+                      <button aria-label={`Delete ${set.name}`} onClick={() => deleteSet(set)}><Icon name="trash" /></button>
                     </div>
                   </div>
                 </article>
               );
             })}
+            <button className="new-set-card" onClick={() => setSearchOpen(true)}>
+              <span className="new-plus"><Icon name="plus" /></span>
+              <strong>Start a new BrickCheck</strong>
+              <small>Search the LEGO catalog</small>
+            </button>
           </section>
         </main>
       ) : activeSet ? (
-        <main className="workbench">
+        <main className="workbench" id="main-content">
           <section className="set-hero">
             <button
               className="set-cover"
@@ -1828,21 +1479,19 @@ export default function BrickCheckApp() {
               <PartVisual src={activeSet.setImage} name={activeSet.name} />
             </button>
             <div className="set-title-block">
-              <button className="back-link" onClick={() => setPage("sets")}>← My Sets</button>
+              <button className="back-link" onClick={() => setPage("sets")}><Icon name="back" width="14" height="14" />My Sets</button>
               <div className="set-kicker"><span>{activeSet.setNum}</span><span>{activeSet.year}</span><span>{activeSet.theme}</span></div>
               <h1>{activeSet.name}</h1>
               <p>{activeSet.parts.length} part lots · {activeSet.minifigs.length} minifig{activeSet.minifigs.length === 1 ? "" : "s"} · {activeSet.catalogParts.toLocaleString()} catalog pieces</p>
             </div>
             <div className="progress-summary">
-              <div className="progress-ring" style={{ "--progress": `${progress.percent * 3.6}deg` } as React.CSSProperties}>
-                <div><strong>{progress.percent}%</strong><span>found</span></div>
+              <div className="progress-head"><span>Set progress</span><strong>{progress.percent}%</strong></div>
+              <div className="card-progress-line" role="progressbar" aria-label="Set completion" aria-valuenow={progress.percent} aria-valuemin={0} aria-valuemax={100}>
+                <span style={{ width: `${progress.percent}%` }} />
               </div>
-              <div className="progress-numbers">
-                <strong>{progress.found}<span> / {progress.required}</span></strong>
-                <small>pieces checked</small>
-              </div>
+              <div className="progress-numbers"><strong>{progress.found.toLocaleString()}</strong> of {progress.required.toLocaleString()} found · {(progress.required - progress.found).toLocaleString()} missing</div>
               <div className="progress-actions">
-                <button className="secondary compact" onClick={() => exportSet(activeSet)}>↓ Save file</button>
+                <button className="secondary compact" onClick={() => exportSet(activeSet)}><Icon name="download" width="15" height="15" />Save progress</button>
                 <button
                   className="secondary compact bricklink-export"
                   aria-label="Generate copyable BrickLink Wanted List XML"
@@ -1856,10 +1505,11 @@ export default function BrickCheckApp() {
             </div>
           </section>
 
-          <section className="inventory-toolbar">
+          <section className="inventory-toolbar" aria-label="Inventory controls">
+            <div className="toolbar-primary">
             <div className="filter-tabs" role="group" aria-label="Filter parts">
               {(["all", "missing", "found", "minifigs"] as FilterMode[]).map((item) => (
-                <button key={item} className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>
+                <button key={item} className={filter === item ? "active" : ""} aria-pressed={filter === item} onClick={() => setFilter(item)}>
                   {item === "minifigs" ? "Minifigs" : item[0].toUpperCase() + item.slice(1)}
                   {item === "missing" && <span>{missingLots}</span>}
                   {item === "minifigs" && <span>{activeSet.minifigs.length}</span>}
@@ -1867,9 +1517,16 @@ export default function BrickCheckApp() {
               ))}
             </div>
             <label className="parts-search">
-              <span aria-hidden="true">⌕</span>
-              <input value={partQuery} onChange={(event) => setPartQuery(event.target.value)} placeholder="Filter by part, color or ID" />
+              <Icon name="search" />
+              <input aria-label="Search inventory by name, dimensions, color or part number" value={partQuery} onChange={(event) => setPartQuery(event.target.value)} placeholder="Try tile 1x2, black, or a part number" />
+              {partQuery && <button type="button" aria-label="Clear part search" onClick={() => setPartQuery("")}><Icon name="close" width="14" height="14" /></button>}
             </label>
+            <div className="view-switch" role="group" aria-label="View style">
+              <button className={view === "grid" ? "active" : ""} aria-pressed={view === "grid"} aria-label="Grid view" onClick={() => { setView("grid"); localStorage.setItem(VIEW_STORAGE, "grid"); }}><Icon name="grid" /></button>
+              <button className={view === "list" ? "active" : ""} aria-pressed={view === "list"} aria-label="List view" onClick={() => { setView("list"); localStorage.setItem(VIEW_STORAGE, "list"); }}><Icon name="list" /></button>
+            </div>
+            </div>
+            <div className="toolbar-secondary">
             <div className="inventory-sort">
               <label className="inventory-select">
                 <span>Sort</span>
@@ -1911,9 +1568,7 @@ export default function BrickCheckApp() {
                 <option value="status">Missing / completed</option>
               </select>
             </label>
-            <div className="view-switch" role="group" aria-label="View style">
-              <button className={view === "grid" ? "active" : ""} aria-label="Grid view" onClick={() => { setView("grid"); localStorage.setItem(VIEW_STORAGE, "grid"); }}>▦</button>
-              <button className={view === "list" ? "active" : ""} aria-label="List view" onClick={() => { setView("list"); localStorage.setItem(VIEW_STORAGE, "list"); }}>☷</button>
+            <span className="toolbar-note">Click a part to add one · Click its count to edit</span>
             </div>
           </section>
 
@@ -1924,10 +1579,10 @@ export default function BrickCheckApp() {
                   <h2>Standard parts</h2>
                   <span>{standardParts.length} lots shown</span>
                 </div>
-                <p>Tap a checkmark to mark the full quantity, or count pieces one by one.</p>
+                <p>Click a part to add one. Click the quantity to edit.</p>
               </div>
               {standardParts.length ? (
-                <PartGroups groups={groupedStandardParts} view={view} onFound={(part, value) => setPartFound(part.id, value)} />
+                <PartGroups groups={groupedStandardParts} view={view} onFound={setPartFound} />
               ) : (
                 <div className="empty-state"><span>⌕</span><strong>No parts match</strong><p>Try another filter or search term.</p></div>
               )}
@@ -1960,20 +1615,20 @@ export default function BrickCheckApp() {
                       aria-label={`Add one found ${fig.name}`}
                       onClick={(event) => {
                         if ((event.target as HTMLElement).closest("button")) return;
-                        if (fig.found < fig.quantity) setFigFound(fig.id, fig.found + 1);
+                        if (fig.found < fig.quantity) setFigFound(fig.id, { delta: 1 });
                       }}
                       onKeyDown={(event) => {
                         if (event.target !== event.currentTarget) return;
                         if ((event.key === "Enter" || event.key === " ") && fig.found < fig.quantity) {
                           event.preventDefault();
-                          setFigFound(fig.id, fig.found + 1);
+                          setFigFound(fig.id, { delta: 1 });
                         }
                       }}
                     >
                       <button className="image-check" aria-label={fig.found >= fig.quantity ? `Mark ${fig.name} missing` : `Mark ${fig.name} found`} onClick={() => setFigFound(fig.id, fig.found >= fig.quantity ? 0 : fig.quantity)}>{fig.found >= fig.quantity ? "✓" : ""}</button>
                       <div className="minifig-image"><PartVisual src={fig.imageUrl} name={fig.name} /></div>
                       <div><span className="part-number">{fig.figNum}</span><h3>{fig.name}</h3></div>
-                      <Counter found={fig.found} quantity={fig.quantity} onChange={(value) => setFigFound(fig.id, value)} />
+                      <Counter name={fig.name} found={fig.found} quantity={fig.quantity} onChange={(value) => setFigFound(fig.id, value)} />
                     </article>
                   ))}
                 </div>
@@ -1988,6 +1643,8 @@ export default function BrickCheckApp() {
                       <PartGroups
                         groups={groupParts(
                           (fig.parts ?? []).filter((part) => {
+                            const figureMatches = partMatcher({ name: fig.name, partNum: fig.figNum, colorName: "" });
+                            if (!figureMatches && !partMatcher(part)) return false;
                             if (filter === "found") return part.found >= part.quantity;
                             if (filter === "missing") return part.found < part.quantity;
                             return true;
@@ -1997,7 +1654,8 @@ export default function BrickCheckApp() {
                           sortDirection,
                         )}
                         view={view}
-                        onFound={(part, value) => setPartFound(part.id, value, fig.id)}
+                        onFound={setPartFound}
+                        figId={fig.id}
                       />
                     </div>
                   ))}
@@ -2017,7 +1675,7 @@ export default function BrickCheckApp() {
                 <p>These extras are packed separately from the pieces required to complete the model.</p>
               </div>
               {spareParts.length ? (
-                <PartGroups groups={groupedSpareParts} view={view} onFound={(part, value) => setPartFound(part.id, value)} />
+                <PartGroups groups={groupedSpareParts} view={view} onFound={setPartFound} />
               ) : (
                 <div className="empty-state"><strong>No spare parts match</strong><p>Try another filter or search term.</p></div>
               )}
@@ -2025,8 +1683,8 @@ export default function BrickCheckApp() {
           )}
         </main>
       ) : (
-        <main className="no-set">
-          <div className="new-plus">＋</div>
+        <main className="no-set" id="main-content">
+          <div className="new-plus"><Icon name="plus" /></div>
           <h1>Start your first BrickCheck</h1>
           <p>Find a set, then work through every pictured part.</p>
           <button className="primary" onClick={() => setSearchOpen(true)}>Find a set</button>
@@ -2040,15 +1698,15 @@ export default function BrickCheckApp() {
       </footer>
 
       {searchOpen && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setSearchOpen(false); }}>
+        <Modal onClose={() => setSearchOpen(false)} busy={false}>
           <section className={`search-modal ${searchResults.length ? "has-results" : ""}`} role="dialog" aria-modal="true" aria-labelledby="search-title">
-            <button className="modal-close" aria-label="Close" onClick={() => setSearchOpen(false)}>×</button>
+            <button className="modal-close" aria-label="Close" onClick={() => setSearchOpen(false)}><Icon name="close" /></button>
             <p className="eyebrow">NEW BRICKCHECK</p>
             <h2 id="search-title">Which build is in the bin?</h2>
             <p>Search LEGO sets, or paste a Rebrickable MOC URL or ID.</p>
             <form className="big-search" onSubmit={searchSets}>
-              <span aria-hidden="true">⌕</span>
-              <input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Try 75379, Batman or MOC-262378" />
+              <Icon name="search" />
+              <input aria-label="Search Rebrickable catalog" autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Try 75379, Batman or MOC-262378" />
               <button disabled={searching}>{searching ? "Searching…" : mocCandidate ? "Import MOC" : "Search"}</button>
             </form>
             <div className="search-controls">
@@ -2061,7 +1719,7 @@ export default function BrickCheckApp() {
                   ["brickheadz", "BrickHeadz"],
                   ["mocs", "Custom MOCs"],
                 ] as [SearchKind, string][]).map(([value, label]) => (
-                  <button type="button" className={searchKind === value ? "active" : ""} key={value} onClick={() => setSearchKind(value)}>{label}</button>
+                  <button type="button" className={searchKind === value ? "active" : ""} aria-pressed={searchKind === value} key={value} onClick={() => setSearchKind(value)}>{label}</button>
                 ))}
               </div>
               {searchKind !== "mocs" && <label className="search-sort">
@@ -2075,7 +1733,7 @@ export default function BrickCheckApp() {
                 </select>
               </label>}
             </div>
-            {error && <div className="inline-error">{error}</div>}
+            {error && <div className="inline-error" role="alert">{error}</div>}
             {mocCandidate && (
               <div className="moc-detected-card">
                 <div className="moc-detected-mark">MOC</div>
@@ -2094,15 +1752,16 @@ export default function BrickCheckApp() {
             {!apiKey && (
               <div className="source-callout">
                 <div><span>R</span></div>
-                <p><strong>Connect the set catalog</strong><small>A free Rebrickable API key unlocks exact inventories and part images. It stays in this browser.</small></p>
+                <p><strong>Connect the set catalog</strong><small>A free Rebrickable API key unlocks exact inventories and part images.</small></p>
                 <button onClick={() => { setApiDraft(apiKey); setSettingsOpen(true); }}>Connect</button>
               </div>
             )}
+            {searching && !visibleSearchResults.length && <div className="search-status" role="status">Searching the catalog…</div>}
             {visibleSearchResults.length > 0 && (
               <>
                 <div className="search-results-heading"><strong>{visibleSearchResults.length} results</strong><span>{searching ? "Updating suggestions…" : "Grid view"}</span></div>
-                <div className="search-results">
-                  {visibleSearchResults.map((result) => (
+                <div className="search-results" aria-busy={searching}>
+                  {visibleSearchResults.slice(0, searchLimit).map((result) => (
                     <article key={`${result.kind}:${result.set_num}`}>
                       <button className="search-result-image" aria-label={`View ${result.name} photo`} onClick={() => openGallery(result.name, result.set_img_url ? [result.set_img_url] : [], result.set_url)}>
                         <PartVisual src={result.set_img_url} name={result.name} />
@@ -2112,20 +1771,21 @@ export default function BrickCheckApp() {
                         <h3>{result.name}</h3>
                         <p>{result.num_parts.toLocaleString()} pieces · {result.kind === "minifig" ? "Minifigure" : (result.themeName || "LEGO set")}</p>
                       </section>
-                      <button className="primary small" disabled={Boolean(addingSet)} onClick={() => addSearchResult(result)}>{addingSet === result.set_num ? "Loading…" : "Start check"}</button>
+                      <button className="primary small" disabled={Boolean(addingSet)} onClick={() => addSearchResult(result)}>{addingSet === result.set_num ? "Loading…" : sets.some((set) => set.setNum === result.set_num) ? "Continue check" : "Start check"}</button>
                     </article>
                   ))}
                 </div>
+                {visibleSearchResults.length > searchLimit && <div className="search-load-more"><button type="button" className="secondary" onClick={() => setSearchLimit((limit) => limit + 48)}>Show more · {visibleSearchResults.length - searchLimit} remaining</button></div>}
               </>
             )}
           </section>
-        </div>
+        </Modal>
       )}
 
       {mocOpen && (
-        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !mocImporting) setMocOpen(false); }}>
+        <Modal onClose={() => setMocOpen(false)} busy={mocImporting} topLayer>
           <section className="moc-modal" role="dialog" aria-modal="true" aria-labelledby="moc-import-title">
-            <button className="modal-close" aria-label="Close MOC importer" disabled={mocImporting} onClick={() => setMocOpen(false)}>×</button>
+            <button className="modal-close" aria-label="Close MOC importer" disabled={mocImporting} onClick={() => setMocOpen(false)}><Icon name="close" /></button>
             <p className="eyebrow">CUSTOM BRICKCHECK</p>
             <h2 id="moc-import-title">Import a Rebrickable MOC</h2>
             <p className="moc-modal-intro">Identify the MOC, then add its Rebrickable CSV inventory. BrickCheck will retrieve the part names, colors and images.</p>
@@ -2172,19 +1832,19 @@ export default function BrickCheckApp() {
               <summary>Or paste the CSV contents</summary>
               <textarea value={mocInventoryText} onChange={(event) => { setMocInventoryText(event.target.value); setMocInventoryFileName(""); setMocError(""); }} placeholder={'Part,Color,Quantity,Is Spare\n3001,0,4,False'} spellCheck={false} />
             </details>
-            {mocError && <div className="inline-error">{mocError}</div>}
+            {mocError && <div className="inline-error" role="alert">{mocError}</div>}
             <div className="moc-actions">
               {mocDraftReference && <a href={mocDraftReference.pageUrl} target="_blank" rel="noreferrer">Open MOC on Rebrickable ↗</a>}
               <button className="primary" disabled={mocImporting} onClick={() => void importMoc()}>{mocImporting ? "Loading parts…" : "Add to My Sets"}</button>
             </div>
           </section>
-        </div>
+        </Modal>
       )}
 
       {accountOpen && (
-        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target && !accountBusy) setAccountOpen(false); }}>
+        <Modal onClose={() => setAccountOpen(false)} busy={accountBusy} topLayer>
           <section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="account-title">
-            <button className="modal-close" aria-label="Close account" disabled={accountBusy} onClick={() => setAccountOpen(false)}>×</button>
+            <button className="modal-close" aria-label="Close account" disabled={accountBusy} onClick={() => setAccountOpen(false)}><Icon name="close" /></button>
             <div className="account-mark">{account ? account.username.slice(0, 1).toUpperCase() : "@"}</div>
             <p className="eyebrow">BRICKCHECK ACCOUNT</p>
             <h2 id="account-title">{account ? account.username : "Sign in to sync"}</h2>
@@ -2205,7 +1865,7 @@ export default function BrickCheckApp() {
                       ? "Sync needs attention"
                       : "Everything is synced"}</strong>
                 </div>
-                {accountError && <div className="inline-error">{accountError}</div>}
+                {accountError && <div className="inline-error" role="alert">{accountError}</div>}
                 <div className="account-actions">
                   <button className="secondary" disabled={accountBusy} onClick={() => void signOutAccount()}>Sign out</button>
                   <button className="primary" disabled={accountBusy} onClick={() => void syncAccountNow()}>{accountBusy ? "Working…" : "Sync now"}</button>
@@ -2238,7 +1898,7 @@ export default function BrickCheckApp() {
                   />
                 </label>
                 <small>Username: 3–30 letters, numbers, underscores or hyphens.</small>
-                {accountError && <div className="inline-error">{accountError}</div>}
+                {accountError && <div className="inline-error" role="alert">{accountError}</div>}
                 <div className="account-actions">
                   <button type="button" className="secondary" disabled={accountBusy} onClick={() => void authenticateAccount(true)}>Create account</button>
                   <button type="submit" className="primary" disabled={accountBusy}>{accountBusy ? "Working…" : "Sign in"}</button>
@@ -2246,19 +1906,19 @@ export default function BrickCheckApp() {
               </form>
             )}
           </section>
-        </div>
+        </Modal>
       )}
 
       {settingsOpen && (
-        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setSettingsOpen(false); }}>
+        <Modal onClose={() => setSettingsOpen(false)} busy={false} topLayer>
           <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-            <button className="modal-close" aria-label="Close" onClick={() => setSettingsOpen(false)}>×</button>
-            <div className="settings-icon">R</div>
-            <p className="eyebrow">DATA SOURCE</p>
-            <h2 id="settings-title">Connect Rebrickable</h2>
+            <button className="modal-close" aria-label="Close" onClick={() => setSettingsOpen(false)}><Icon name="close" /></button>
+            <div className="settings-icon"><Icon name="settings" /></div>
+            <p className="eyebrow">BRICKCHECK</p>
+            <h2 id="settings-title">Settings</h2>
             <p>Rebrickable provides official set inventories, colors, minifigures and—most importantly—the part photos.</p>
             <label>
-              <span>API key</span>
+              <span>Rebrickable API key</span>
               <input type="password" value={apiDraft} onChange={(event) => setApiDraft(event.target.value)} placeholder="Paste your Rebrickable API key" />
             </label>
             <p className="privacy-note">{account
@@ -2270,8 +1930,8 @@ export default function BrickCheckApp() {
                 <span>Use the light or dark catalog theme.</span>
               </div>
               <div className="theme-switch" role="group" aria-label="Color theme">
-                <button className={theme === "light" ? "active" : ""} onClick={() => setTheme("light")}>Light</button>
-                <button className={theme === "dark" ? "active" : ""} onClick={() => setTheme("dark")}>Dark</button>
+                <button className={theme === "light" ? "active" : ""} aria-pressed={theme === "light"} onClick={() => setTheme("light")}>Light</button>
+                <button className={theme === "dark" ? "active" : ""} aria-pressed={theme === "dark"} onClick={() => setTheme("dark")}>Dark</button>
               </div>
             </div>
             <div className="settings-actions">
@@ -2279,13 +1939,13 @@ export default function BrickCheckApp() {
               <button className="primary" onClick={saveApiKey}>{apiDraft.trim() ? "Save connection" : "Remove key"}</button>
             </div>
           </section>
-        </div>
+        </Modal>
       )}
 
       {gallery && (
-        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setGallery(null); }}>
+        <Modal onClose={() => setGallery(null)} busy={false} topLayer>
           <section className="gallery-modal" role="dialog" aria-modal="true" aria-label={`${gallery.title} image gallery`}>
-            <button className="modal-close" aria-label="Close gallery" onClick={() => setGallery(null)}>×</button>
+            <button className="modal-close" aria-label="Close gallery" onClick={() => setGallery(null)}><Icon name="close" /></button>
             <div className="gallery-stage">
               <img src={gallery.images[gallery.index]} alt={`${gallery.title} catalog view ${gallery.index + 1}`} />
               {gallery.images.length > 1 && (
@@ -2305,13 +1965,13 @@ export default function BrickCheckApp() {
               </div>
             )}
           </section>
-        </div>
+        </Modal>
       )}
 
       {bricklinkXml && (
-        <div className="modal-backdrop top-layer" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setBricklinkXml(null); }}>
+        <Modal onClose={() => setBricklinkXml(null)} busy={false} topLayer>
           <section className="bricklink-modal" role="dialog" aria-modal="true" aria-labelledby="bricklink-xml-title">
-            <button className="modal-close" aria-label="Close BrickLink XML" onClick={() => setBricklinkXml(null)}>×</button>
+            <button className="modal-close" aria-label="Close BrickLink XML" onClick={() => setBricklinkXml(null)}><Icon name="close" /></button>
             <p className="eyebrow">BRICKLINK WANTED LIST</p>
             <h2 id="bricklink-xml-title">Copy missing parts XML</h2>
             <p className="bricklink-copy-summary">
@@ -2334,22 +1994,24 @@ export default function BrickCheckApp() {
               </div>
             </div>
           </section>
-        </div>
+        </Modal>
       )}
 
-      {notice && <div className="toast"><span>✓</span>{notice}</div>}
+      {notice && <div className="toast" role="status"><span><Icon name="check" /></span>{notice}<button aria-label="Dismiss notification" onClick={() => setNotice("")}><Icon name="close" width="14" height="14" /></button></div>}
     </div>
   );
 }
 
-function PartGroups({
+const PartGroups = memo(function PartGroups({
   groups,
   view,
   onFound,
+  figId,
 }: {
   groups: PartGroup[];
   view: ViewMode;
-  onFound: (part: PartItem, value: number) => void;
+  onFound: (partId: string, value: FoundUpdate, figId?: string) => void;
+  figId?: string;
 }) {
   return (
     <div className="part-groups">
@@ -2363,30 +2025,20 @@ function PartGroups({
           )}
           <div className={`parts-${view}`}>
             {partGroup.parts.map((part) => (
-              <PartCard key={part.id} part={part} view={view} onFound={(value) => onFound(part, value)} />
+              <PartCard key={part.id} part={part} view={view} figId={figId} onFound={onFound} />
             ))}
           </div>
         </section>
       ))}
     </div>
   );
-}
+});
 
-function Counter({ found, quantity, onChange }: { found: number; quantity: number; onChange: (value: number) => void }) {
-  return (
-    <div className="counter" aria-label={`${found} of ${quantity} found`}>
-      <button aria-label="Subtract one" disabled={found <= 0} onClick={() => onChange(found - 1)}>−</button>
-      <strong>{found}<span>/{quantity}</span></strong>
-      <button aria-label="Add one" disabled={found >= quantity} onClick={() => onChange(found + 1)}>＋</button>
-    </div>
-  );
-}
-
-function PartCard({ part, view, onFound }: { part: PartItem; view: ViewMode; onFound: (value: number) => void }) {
+const PartCard = memo(function PartCard({ part, view, onFound, figId }: { part: PartItem; view: ViewMode; onFound: (partId: string, value: FoundUpdate, figId?: string) => void; figId?: string }) {
   const complete = part.found >= part.quantity;
   const cardRef = useRef<HTMLElement>(null);
-  const changeFound = (value: number) => {
-    if (value > part.found && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  const changeFound = (value: FoundUpdate) => {
+    if (resolveFound(part.found, part.quantity, value) > part.found && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       const card = cardRef.current;
       card?.getAnimations().forEach((animation) => animation.cancel());
       card?.animate(
@@ -2399,7 +2051,7 @@ function PartCard({ part, view, onFound }: { part: PartItem; view: ViewMode; onF
         { duration: 190, easing: "cubic-bezier(.2,.7,.3,1)" },
       );
     }
-    onFound(value);
+    onFound(part.id, value, figId);
   };
   return (
     <article
@@ -2410,13 +2062,13 @@ function PartCard({ part, view, onFound }: { part: PartItem; view: ViewMode; onF
       aria-label={`Add one found ${part.name}. ${part.found} of ${part.quantity} found.`}
       onClick={(event) => {
         if ((event.target as HTMLElement).closest("button")) return;
-        if (part.found < part.quantity) changeFound(part.found + 1);
+        if (part.found < part.quantity) changeFound({ delta: 1 });
       }}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) return;
         if ((event.key === "Enter" || event.key === " ") && part.found < part.quantity) {
           event.preventDefault();
-          changeFound(part.found + 1);
+          changeFound({ delta: 1 });
         }
       }}
     >
@@ -2432,10 +2084,10 @@ function PartCard({ part, view, onFound }: { part: PartItem; view: ViewMode; onF
       </div>
       <div className="part-copy">
         <div className="part-id-line"><span className="color-dot" style={{ background: `#${part.colorRgb}` }} /><span className="part-number">{part.partNum}</span><span className="found-label">FOUND</span></div>
-        <h3>{part.name}</h3>
+        <h3 title={part.name}>{part.name}</h3>
         <p>{part.colorName}</p>
       </div>
-      <Counter found={part.found} quantity={part.quantity} onChange={changeFound} />
+      <Counter name={part.name} found={part.found} quantity={part.quantity} onChange={changeFound} />
     </article>
   );
-}
+});

@@ -1,6 +1,12 @@
+[![x-g logo](https://github.com/user-attachments/assets/747c69e5-1165-48f2-b535-44608a8b7de1)](https://brickcheck.x-g.ca/)
+
 # BrickCheck
 
-BrickCheck helps you recover complete LEGO sets from a mixed parts bin. Search the Rebrickable catalog, work through a pictured inventory, track multiple sets, and move progress between browsers with JSON import and export.
+> BrickCheck helps you recover complete LEGO sets from a mixed parts bin. Search the Rebrickable catalog, work through a pictured inventory, track multiple sets, and move progress between browsers with JSON import and export.
+
+[![View live](https://img.shields.io/badge/View_live-brickcheck.x--g.ca-222?style=for-the-badge)](https://brickcheck.x-g.ca/)
+
+[![BrickCheck showing the My Sets dashboard and catalog search controls](./docs/screenshot.jpg)](https://brickcheck.x-g.ca/)
 
 ## Features
 
